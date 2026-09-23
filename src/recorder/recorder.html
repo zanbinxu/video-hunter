@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Video Hunter · 抓流 / 录制管理</title>
+  <link rel="stylesheet" href="../shared/ui.css" />
+</head>
+<body>
+  <header class="top">
+    <img class="logo" src="../../icons/icon-32.png" width="24" height="24" alt="" />
+    <div class="top-text">
+      <div class="top-title">抓流 / 录制管理</div>
+      <div class="top-url" id="subtitle">抓流优先；抓不到地址才用录制兜底</div>
+    </div>
+    <button class="btn ghost" id="refresh">刷新</button>
+  </header>
+
+  <div class="notice" id="notice" hidden></div>
+
+  <main>
+    <section class="card">
+      <div class="card-title">当前状态<span class="hint" id="stage-hint"></span></div>
+      <div class="big-timer"><span class="dot" id="live-dot"></span><span id="timer">00:00:00</span></div>
+      <div class="stats">
+        <span id="st-frames">0 帧</span>
+        <span id="st-dropped">丢帧 0</span>
+        <span id="st-size">0 B</span>
+        <span id="st-codec">—</span>
+      </div>
+      <div class="plan-summary" id="target-info" style="margin-top:14px">—</div>
+      <div class="bar" id="finalize-bar" hidden><div class="bar-fill" id="finalize-fill"></div></div>
+      <div class="actions">
+        <button class="btn primary big" id="start">开始录制</button>
+        <button class="btn danger big" id="stop" disabled>停止并保存</button>
+        <button class="btn" id="snapshot" hidden>先保存已录到的部分</button>
+        <button class="btn primary" id="retry" hidden>重试保存</button>
+        <button class="btn" id="discard" hidden>放弃这一份</button>
+      </div>
+      <div class="plan-summary" id="snapshot-hint" hidden style="margin-top:10px">
+        抓流<b>不能暂停</b> —— 数据是播放器边解边喂过来的，挂起钩子就等于把那段时间的码流丢掉，
+        产物里会留下真空洞。想中途留一份就点上面那个按钮：<b>它把此刻已经收到的写成一个文件，抓流继续</b>。
+      </div>
+      <div class="field row" id="autosave-row" style="margin-top:12px" hidden>
+        <label for="autosave" title="一个视频播完、页面换下一个时，自动把刚才那段存成一个文件">
+          抓流：每个视频播完自动保存
+        </label>
+        <input type="checkbox" id="autosave" />
+      </div>
+      <div class="plan-summary" id="autosave-hint" hidden>
+        关掉之后边界仍然会被识别，但<b>不会自动存</b> —— 上一段会和下一段攒在同一个缓冲里
+        （下一段的时间戳从 0 重新开始，时间轴会乱）。所以换视频之前请自己点一次「先保存已录到的部分」。
+      </div>
+      <div class="field row" id="autosnap-row" style="margin-top:12px" hidden>
+        <label for="autosnap" title="抓流期间每隔一段时间，把已经录到的部分存成一个文件，随时都有一份能播的">
+          抓流：自动保存已录到的部分
+        </label>
+        <span style="display:flex;gap:8px;align-items:center">
+          <span class="muted">每</span>
+          <select id="autosnap-minutes" title="多久自动存一次">
+            <option value="5">5 分钟</option>
+            <option value="10">10 分钟</option>
+            <option value="30">30 分钟</option>
+          </select>
+          <select id="autosnap-basis" title="这 N 分钟按什么算">
+            <option value="wall">录制时间</option>
+            <option value="media">视频内容时长</option>
+          </select>
+          <input type="checkbox" id="autosnap" />
+        </span>
+      </div>
+      <div class="plan-summary" id="autosnap-hint" hidden>
+        名字里带 <b>-自动部分</b> 的那一份就是它：<b>只留最新一份</b>（写完新的再删旧的），
+        所以不会成倍占空间。已经抓到的随时能播、能导出，中途出意外最多只丢最后这几分钟。<br />
+        <b>按什么算</b>：<b>录制时间</b>＝你录了多久（防意外的口径，崩了最多丢这么多投入）；
+        <b>视频内容时长</b>＝抓到的内容有多长 —— 你开了倍速播放时这两个差好几倍
+        （4 倍速下"录制 10 分钟"其实内容有 40 分钟）。没有可读时间戳的流（WebM 那种）
+        会自动回落成录制时间，并当场告诉你。<br />
+        想留某个时间点的检查点，自己点一次「先保存已录到的部分」——
+        那份<b>不会被自动保存覆盖</b>。
+      </div>
+
+      <div class="field row" id="autoexport-row" style="margin-top:12px" hidden>
+        <label for="autoexport" title="产物写进「抓流文件」之后自动落一份到下载目录；私有存储里那份会保留，本地误删了还能用「保存到磁盘」再导一次">
+          抓流：产物自动导出到下载目录
+        </label>
+        <input type="checkbox" id="autoexport" />
+      </div>
+      <div class="plan-summary" id="autoexport-hint" hidden>
+        每存出一份<b>完整产物</b>（停止收尾 / 换集切分 / 你点「先保存已录到的部分」）就自动交浏览器下载，
+        落到「设置 → 下载子目录」下面。<b>私有存储里那份会保留</b>，「保存到磁盘」按钮也还在 ——
+        本地误删了还能再导一次。滚动自动保存那种临时的「-自动部分」<b>不会</b>自动导出。
+      </div>
+
+      <div class="field row" id="autocut-row" style="margin-top:12px" hidden>
+        <label for="autocut" title="抓流的数据全在内存里，收尾时合并要一整块内存；攒到阈值就先写出一段完整文件、清空缓冲接着抓，避免最后关头合不出来">
+          抓流：攒太大自动切一段
+        </label>
+        <span style="display:flex;gap:8px;align-items:center">
+          <span class="muted">到</span>
+          <select id="autocut-mb" title="攒到多大就切一段">
+            <option value="300">300 MB</option>
+            <option value="600">600 MB</option>
+            <option value="1200">1200 MB</option>
+          </select>
+          <input type="checkbox" id="autocut" />
+        </span>
+      </div>
+      <div class="plan-summary" id="autocut-hint" hidden>
+        抓流的数据<b>全在内存里</b>，收尾时合并还需要一整块（实测抓到的超过 ~1 GB 就合不出来了，
+        那时只能全丢）。所以到阈值就先写出一段<b>完整文件</b>、清空缓冲接着抓 ——
+        代价是<b>一个视频会分成几个文件</b>（名字带 <b>-2</b>、<b>-3</b>，按顺序就是完整内容）。
+        关掉它的话，接近阈值时会提前提醒你手动「先保存已录到的部分」。
+      </div>
+    </section>
+
+    <section class="card" id="capture-card">
+      <div class="card-title">
+        抓流文件
+        <span class="hint">播放器里<strong>已经解密好</strong>的原始码流 · 不重编码、无水印</span>
+      </div>
+      <div class="plan-summary row" id="storage-row" style="margin-bottom:10px">
+        <span id="storage-use" class="muted">正在读取存储用量…</span>
+        <button class="btn" id="clean-exported" hidden>清理已导出的</button>
+      </div>
+      <div id="captures" class="variants"></div>
+    </section>
+
+    <section class="card" id="record-card">
+      <div class="card-title">
+        录制文件
+        <span class="hint">兜底路线：抓不到地址时录标签页画面</span>
+      </div>
+      <div id="recordings" class="variants"></div>
+      <div class="bar" id="export-bar" hidden><div class="bar-fill" id="export-fill"></div></div>
+    </section>
+
+    <section class="card">
+      <div class="card-title">拖不动进度条？体检一下<span class="hint">任何 MP4 都行，不限于这个扩展做出来的</span></div>
+      <div class="plan-summary">
+        播放器里拖进度条会被弹回去，只有两个原因：<b>没有样本索引</b>（分片式 MP4），
+        或者<b>时间轴中间有一段空洞</b>（录制时标签页被切到后台 / 屏幕锁定，采集源一帧都不给，
+        而时间戳还在走）。第二种 ffprobe 查不出来、文件也能播，只有把样本表算一遍才看得见。<br />
+        选一个文件，下面会直接告诉你它属于哪种情况；是空洞的话可以<b>就地修好</b>
+        —— 只改样本表里的时长，不重编码、不搬数据，文件大小一个字都不变。
+      </div>
+      <div class="actions" style="margin-top:14px">
+        <input type="file" id="diag-file" accept="video/mp4,video/*,.mp4,.m4v,.mov" style="display:none" />
+        <button class="btn primary" id="diag-pick">选择视频文件体检</button>
+        <button class="btn" id="diag-fix" hidden>另存为修复版</button>
+      </div>
+      <div class="plan-summary" id="diag-report" style="margin-top:12px" hidden></div>
+      <div class="bar" id="diag-bar" hidden><div class="bar-fill" id="diag-fill"></div></div>
+    </section>
+
+    <section class="card">
+      <div class="card-title">怎么用</div>
+      <ol class="steps">
+        <li>在要录的视频页面上，<b>点浏览器工具栏的扩展图标</b>打开面板。</li>
+        <li>要抓原始码流（站点有网页水印、或自己加密的，用这个）就点「<b>抓流</b>」；抓流也不行才用「<b>录制</b>」兜底。</li>
+        <li>抓流结束会自动跳回这个页面，文件就在上面的「<b>抓流文件</b>」里，点「保存到磁盘」导出。</li>
+        <li>这两件事的权限都绑定在「当前活动标签页」上 —— 所以必须在目标页面上做。</li>
+        <li>扩展会自动刷新那个页面，并把视频<b>拨回第一帧重新播放</b>（有些站点会记住播放位置，光刷新不够）。</li>
+        <li>播完之后<b>会自动停止并保存</b>，不用你盯着。也可以随时手动点「停止并保存」。</li>
+      </ol>
+      <div class="plan-summary" style="margin-top:14px">
+        列表里的<b>时长是文件自己的真实时长</b>（从 MP4 的 mvhd 读出来的），
+        不是"你操作了多久"。抓流期间暂停、拖动、切标签页都会让这两个数差很多 ——
+        以列表里的为准。<br />
+        文件先落在浏览器私有存储里，<b>点「保存到磁盘」才真正进你的下载目录</b>。
+        没保存就删掉页面数据的话文件会一起没。<br />
+        播放器里拖不动进度条的文件，用「<b>体检</b>」查原因，能修的话一键修好。<br />
+        「录制」的编码在浏览器里完成（WebCodecs），<b>不经过任何服务器</b>；耗时约等于视频时长，
+        <b>没有"倍速录一遍"这种捷径</b>（采集按真实时间捕帧，12 倍速只会得到 12 倍速且丢九成帧的文件）。要快就走抓流。
+      </div>
+    </section>
+
+    <pre class="log" id="log"></pre>
+  </main>
+
+  <script type="module" src="recorder.js"></script>
+</body>
+</html>

@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "Video Hunter",
+  "version": "0.2.1",
+  "description": "网页媒体嗅探 + 直链下载 + HLS/TS 分片合并 + DASH 音视频合并 + 录制兜底，全流程本地完成。",
+  "minimum_chrome_version": "116",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_title": "Video Hunter",
+    "default_popup": "src/popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "background": {
+    "service_worker": "src/background/service-worker.js",
+    "type": "module"
+  },
+  "permissions": [
+    "storage",
+    "unlimitedStorage",
+    "tabs",
+    "downloads",
+    "webRequest",
+    "webNavigation",
+    "scripting",
+    "offscreen",
+    "tabCapture",
+    "declarativeNetRequest",
+    "activeTab"
+  ],
+  "optional_permissions": [],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  }
+}

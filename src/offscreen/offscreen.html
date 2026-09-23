@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>Video Hunter · 采集</title>
+</head>
+<body>
+  <!--
+    这是一个「离屏文档」：没有界面，只在后台持有采集流、编码器和封装器。
+
+    为什么必须用它，而不是开一个新标签页采集：
+      chrome.tabCapture 要求被采集的标签页处于**活动状态**。
+      一旦我们打开自己的页面，目标标签页就不再活动，采集根本起不来。
+      离屏文档不是标签页，不会抢焦点，所以目标页始终是活动的。
+
+    它同时也是 MSE 抓流的落地点：页面那边的钩子拿到的原始码流
+    通过消息送到这里，在这里组装、重封装、写进 OPFS。
+
+    mux.js 是 UMD 包（挂成全局 muxjs）。MSE 抓流拿到的可能是 TS 复用流，
+    需要它做重封装 —— tabCapture 那条路用不到，但同一个文档里放着最省事。
+  -->
+  <script src="../../vendor/mux.min.js"></script>
+  <script type="module" src="offscreen.js"></script>
+</body>
+</html>

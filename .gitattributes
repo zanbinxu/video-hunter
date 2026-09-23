@@ -1,0 +1,14 @@
+# 换行符统一：仓库里存 LF，检出时也保持 LF。
+#
+# 为什么这个项目特别需要它：这里的"验证"有好几处是**逐字节比 SHA256**
+# （`npm run pack` 的确定性 zip、打包目录与源码逐个文件比对、工具链里的
+# 覆盖判断）。Windows 上如果有哪一步把 LF 换成了 CRLF，这些比对会平白多出
+# 一堆"内容不一致"，而原因和代码毫无关系。`eol=lf` 也顺带盖过
+# `core.autocrlf=true`（否则每次 add 都要刷一屏 LF→CRLF 警告）。
+* text=auto eol=lf
+
+# 二进制，任何转换都不要做
+*.png binary
+*.ico binary
+*.zip binary
+*.crx binary

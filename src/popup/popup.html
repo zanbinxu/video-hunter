@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Video Hunter</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header class="head">
+    <img class="logo" src="../../icons/icon-32.png" alt="" width="26" height="26" />
+    <div class="head-text">
+      <div class="title">Video Hunter</div>
+      <div class="sub" id="page-host" title="">正在读取当前页面…</div>
+    </div>
+    <button class="icon-btn" id="refresh" title="重新扫描当前页面">⟳</button>
+  </header>
+
+  <div class="recbar" id="recbar" hidden>
+    <span class="dot live"></span>
+    <span class="rec-text" id="rec-text">录制中</span>
+    <button class="mini" id="rec-reload" title="重新加载目标页面，让视频从头开始播">刷新从头播</button>
+    <button class="mini danger" id="rec-stop">停止并保存</button>
+  </div>
+
+  <div class="mergebar" id="mergebar" hidden>
+    <!-- 文字由 popup.js 按"实际嗅到了哪些轨道"填（见 core/merge-plan.js）。
+         这里故意留空：写死一句话曾经真的显示给了用户，而它跟实际状态无关。 -->
+    <span class="merge-text" id="merge-text"></span>
+    <button class="mini primary-mini" id="merge-go">合并下载</button>
+  </div>
+
+  <div class="msebar" id="mse-hint" hidden>
+    <span class="mse-text" id="mse-hint-text"></span>
+    <span class="mse-sub">「抓流」直接存播放器已解密的原始码流 —— 无损、不用等视频播完。</span>
+    <button class="mini primary-mini" id="mse-go">抓流</button>
+  </div>
+
+  <nav class="tabs" id="tabs">
+    <button class="tab is-active" data-filter="all">全部 <b id="c-all">0</b></button>
+    <button class="tab" data-filter="video">视频 <b id="c-video">0</b></button>
+    <button class="tab" data-filter="audio">音频 <b id="c-audio">0</b></button>
+    <button class="tab" data-filter="playlist">播放列表 <b id="c-playlist">0</b></button>
+  </nav>
+
+  <main class="list" id="list">
+    <div class="empty" id="empty">
+      <div class="empty-icon">🔍</div>
+      <p id="empty-msg">暂未捕获到媒体。<br />播放一下页面上的视频，再点右上角刷新。</p>
+    </div>
+  </main>
+
+  <footer class="foot">
+    <label class="switch" title="在每个 &lt;video&gt; 上悬浮一个下载按钮">
+      <input type="checkbox" id="page-buttons" />
+      <span>页面内按钮</span>
+    </label>
+    <div class="foot-right">
+      <button class="ghost-btn" id="capture" title="直接抓播放器已解密好的原始码流（无损、无水印）">抓流</button>
+      <button class="ghost-btn" id="manage" title="打开抓流 / 录制管理：导出、体检、修复">管理</button>
+      <button class="ghost-btn" id="record" title="抓不到地址时，录制标签页画面兜底">录制</button>
+      <!--
+        两种模式的详细对比收在问号里：鼠标移上去（或键盘聚焦）才浮出来。
+        之前是点击展开一整块面板，把媒体列表往下挤 —— 而用户十次里有九次
+        是来点「抓流」或「下载」的，不是来读说明的。
+      -->
+      <span class="help-wrap">
+        <button class="ghost-btn help-q" id="mode-help-q" aria-label="抓流和录制有什么区别、该选哪个">?</button>
+        <div class="help-card" id="mode-panel" role="tooltip">
+          <div class="mode-grid">
+            <div class="mode-col">
+              <div class="mode-head">抓流 <span class="mode-tag">首选</span></div>
+              <div class="mode-body">
+                钩住播放器，把它<b>已经解密好</b>的码流直接存下来。
+                <div class="mode-label ok">优点</div>
+                <ul>
+                  <li>无损、不重编码，画质和源站一样</li>
+                  <li>省 CPU —— 存的是码流，不是重新画一遍</li>
+                  <li>页面上没有多余的东西（不是录屏）</li>
+                </ul>
+                <div class="mode-label bad">缺点</div>
+                <ul>
+                  <li><b>实时</b>：视频多长就得播多长（用浏览器倍速播放能快一些）</li>
+                  <li>要刷新一次页面（但会接着当前进度继续，不用重看）</li>
+                  <li>播放器必须走 MSE；老式直链播放抓不到</li>
+                </ul>
+              </div>
+            </div>
+            <div class="mode-col">
+              <div class="mode-head">录制 <span class="mode-tag ghost-tag">兜底</span></div>
+              <div class="mode-body">
+                抓不到地址时，采集标签页画面重新编码成 MP4。
+                <div class="mode-label ok">优点</div>
+                <ul>
+                  <li>几乎什么都能录到，不需要解析地址</li>
+                  <li>边录边落盘，录多长都不吃内存</li>
+                </ul>
+                <div class="mode-label bad">缺点</div>
+                <ul>
+                  <li>是<b>重新编码</b>：画质有损，画面里会带上播放器自己的一层 UI</li>
+                  <li>必须实时 —— 播多久就得录多久，不能快进</li>
+                  <li>录制期间标签页被切走 / 锁屏，那几段没有画面</li>
+                </ul>
+              </div>
+            </div>
+          </div>
+          <div class="mode-foot">
+            拿不准就先点<b>抓流</b>；它失败了再点<b>录制</b>。两者产物都在「管理」里。
+          </div>
+        </div>
+      </span>
+      <button class="ghost-btn" id="clear">清空</button>
+      <button class="ghost-btn" id="settings-toggle">设置</button>
+    </div>
+  </footer>
+
+  <section class="settings" id="settings" hidden>
+    <div class="field">
+      <label for="s-quality">默认画质</label>
+      <select id="s-quality">
+        <option value="auto">自动（最高）</option>
+        <option value="1080">1080p 及以上优先</option>
+        <option value="720">720p 优先</option>
+        <option value="480">480p 优先</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="s-concurrency">分片并发数</label>
+      <input type="number" id="s-concurrency" min="1" max="16" step="1" />
+    </div>
+    <div class="field">
+      <label for="s-subdir">下载子目录</label>
+      <input type="text" id="s-subdir" placeholder="留空 = 浏览器默认目录" />
+    </div>
+    <div class="field row">
+      <label for="s-streaming" title="决定最终产物是边写边落盘、还是先在内存里攒出整份再写。注意：这条路都要先收齐再组装成带索引的 MP4，不是「边下分片边写分片」。">边下边存（大文件推荐）</label>
+      <input type="checkbox" id="s-streaming" />
+    </div>
+    <div class="field row">
+      <label for="s-autosave" title="抓流时，一个视频播完（或页面换下一个）就自动把这一段存成一个文件">抓流：每个视频播完自动保存</label>
+      <input type="checkbox" id="s-autosave" />
+    </div>
+    <div class="field row stack">
+      <label for="s-autosnap" title="抓流期间每隔一段时间，把已经录到的部分存成一个文件；只留最新一份，随时都有一份能播的">抓流：自动保存已录到的部分</label>
+      <!-- 这一行有三个控件（间隔 + 口径 + 开关），420px 的弹窗里横着放会把标签挤成竖排，
+           所以用 .stack（标签独占一行、控件下一行）—— 详见 popup.css 里的量测注释 -->
+      <span class="controls">
+        <select id="s-autosnap-minutes" title="多久自动存一次">
+          <option value="5">5 分钟</option>
+          <option value="10">10 分钟</option>
+          <option value="30">30 分钟</option>
+        </select>
+        <select id="s-autosnap-basis" title="这 N 分钟按什么算：录制时间（你录了多久）还是视频内容时长（抓到的内容有多长，倍速播放时差好几倍）">
+          <option value="wall">录制时间</option>
+          <option value="media">视频内容时长</option>
+        </select>
+        <input type="checkbox" id="s-autosnap" />
+      </span>
+    </div>
+    <div class="field row">
+      <label for="s-autoexport" title="产物写进「抓流文件」之后自动落一份到下载目录；私有存储里那份会保留，本地误删了还能用管理页的「保存到磁盘」再导一次">抓流：产物自动导出到下载目录</label>
+      <input type="checkbox" id="s-autoexport" />
+    </div>
+    <div class="field row stack">
+      <label for="s-autocut" title="抓流的数据全在内存里，收尾合并还要一整块内存；攒到阈值就先写出一段完整文件、清空缓冲接着抓，避免最后关头合不出来（那时只能全丢）。代价是一个视频会分成几个文件。">抓流：攒太大自动切一段</label>
+      <span class="controls">
+        <select id="s-autocut-mb" title="攒到多大就切一段">
+          <option value="300">300 MB</option>
+          <option value="600">600 MB</option>
+          <option value="1200">1200 MB</option>
+        </select>
+        <input type="checkbox" id="s-autocut" />
+      </span>
+    </div>
+    <div class="field row">
+      <label for="s-fromcurrent" title="点「抓流」时从视频当前播到的那一秒接着抓（仍然会刷新一次页面，但不用重看）。关掉就每次都从头抓一份完整的。">抓流：从当前播放位置开始</label>
+      <input type="checkbox" id="s-fromcurrent" />
+    </div>
+  </section>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

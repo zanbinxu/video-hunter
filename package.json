@@ -1,0 +1,34 @@
+{
+  "name": "video-hunter",
+  "version": "0.2.1",
+  "private": true,
+  "type": "module",
+  "description": "浏览器媒体嗅探 + 直链下载 + HLS/TS 合并 + DASH 音视频合并 + 录制兜底",
+  "license": "MIT",
+  "author": "zanbinxu",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zanbinxu/video-hunter.git"
+  },
+  "scripts": {
+    "check": "node tools/check-syntax.mjs",
+    "icons": "node tools/make-icons.mjs",
+    "vendor": "node tools/vendor.mjs",
+    "build": "node tools/make-icons.mjs && node tools/vendor.mjs && node tools/check-syntax.mjs",
+    "pack": "node tools/check-syntax.mjs && node tools/pack.mjs",
+    "fixtures": "node tools/make-fixtures.mjs",
+    "serve": "node tools/fixture-server.mjs",
+    "test": "node --test --test-isolation=none \"test/*.test.mjs\"",
+    "verify": "node tools/check-syntax.mjs && node --test --test-isolation=none \"test/*.test.mjs\"",
+    "browser-check": "node tools/browser-check.mjs --port 9333 --e2e http://127.0.0.1:8791",
+    "browser-check:extras": "node tools/browser-check.mjs --port 9333 --extras http://127.0.0.1:8791",
+    "browser-check:all": "node tools/browser-check.mjs --port 9333 --e2e http://127.0.0.1:8791 --extras http://127.0.0.1:8791",
+    "browser-check:real": "node tools/browser-check.mjs --port 9333 --real https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_ts/master.m3u8"
+  },
+  "devDependencies": {
+    "mp4-muxer": "^5.2.2",
+    "mp4box": "^2.4.1",
+    "mux.js": "^6.3.0",
+    "webm-muxer": "^5.1.4"
+  }
+}

@@ -1,0 +1,27 @@
+# 依赖与构建产物
+node_modules/
+.npm-cache/
+.tmp/
+
+# 测试样本由 `npm run fixtures` 用本机 ffmpeg 生成（约 5 MB），不入库
+test/fixtures/
+
+# 扩展打包产物
+dist/
+*.zip
+*.crx
+
+# 编辑器
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# 抓下来的媒体 —— 别把产物、课程文件、样本视频误提交进来
+# （`test/fixtures/` 已经在上面整目录忽略，这里再上一道保险）
+*.mp4
+*.mkv
+*.flv
+*.webm
+*.m4a
+*.vep

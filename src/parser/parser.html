@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Video Hunter · 流解析</title>
+  <link rel="stylesheet" href="../shared/ui.css" />
+</head>
+<body>
+  <header class="top">
+    <img class="logo" src="../../icons/icon-32.png" width="24" height="24" alt="" />
+    <div class="top-text">
+      <div class="top-title" id="page-title">流解析</div>
+      <div class="top-url" id="source-url" title=""></div>
+    </div>
+    <button class="btn ghost" id="reload">重新加载</button>
+  </header>
+
+  <div class="notice" id="notice" hidden></div>
+
+  <main>
+    <section class="card" id="card-state">
+      <div class="card-title">流信息</div>
+      <div id="state-body" class="muted">正在读取播放列表…</div>
+    </section>
+
+    <section class="card" id="card-variants" hidden>
+      <div class="card-title">选择画质<span class="hint">默认按设置里的档位自动选中，可随时改</span></div>
+      <div class="variants" id="variants"></div>
+    </section>
+
+    <section class="card" id="card-plan" hidden>
+      <div class="card-title">下载设置</div>
+      <div class="form">
+        <label class="field">
+          <span>分片并发数</span>
+          <input type="number" id="opt-concurrency" min="1" max="16" step="1" />
+        </label>
+        <label class="field">
+          <span>失败重试次数</span>
+          <input type="number" id="opt-retries" min="0" max="8" step="1" />
+        </label>
+        <label class="field check">
+          <input type="checkbox" id="opt-stream" />
+          <span>边下边存<span class="hint" id="stream-hint"></span></span>
+        </label>
+      </div>
+      <div class="plan-summary" id="plan-summary"></div>
+      <div class="actions">
+        <button class="btn primary big" id="start">开始下载</button>
+        <button class="btn danger big" id="cancel" hidden>取消</button>
+      </div>
+    </section>
+
+    <section class="card" id="card-progress" hidden>
+      <div class="card-title">下载进度</div>
+      <div class="bar"><div class="bar-fill" id="bar-fill"></div></div>
+      <div class="stats">
+        <span id="stat-percent">0%</span>
+        <span id="stat-count">0 / 0 分片</span>
+        <span id="stat-bytes">0 B</span>
+        <span id="stat-speed">—</span>
+        <span id="stat-eta">剩余 —</span>
+        <span id="stat-missed" hidden>漏片 0</span>
+      </div>
+      <pre class="log" id="log"></pre>
+    </section>
+  </main>
+
+  <!-- mux.js 是 UMD 包，挂成全局 muxjs；解析器页只需要它做 TS 重封装 -->
+  <script src="../../vendor/mux.min.js"></script>
+  <script type="module" src="parser.js"></script>
+</body>
+</html>
