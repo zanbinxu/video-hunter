@@ -52,13 +52,13 @@
         （下一段的时间戳从 0 重新开始，时间轴会乱）。所以换视频之前请自己点一次「先保存已录到的部分」。
       </div>
       <div class="field row" id="autosnap-row" style="margin-top:12px" hidden>
-        <label for="autosnap" title="抓流期间每隔一段时间，把已经录到的部分存成一个文件，随时都有一份能播的">
+        <label for="autosnap" title="抓流期间每隔一段时间，把已经录到的部分存成一个文件，随时都有一份能播的。推荐 5 分钟：间隔越短，出意外时丢的越少">
           抓流：自动保存已录到的部分
         </label>
         <span style="display:flex;gap:8px;align-items:center">
           <span class="muted">每</span>
-          <select id="autosnap-minutes" title="多久自动存一次">
-            <option value="5">5 分钟</option>
+          <select id="autosnap-minutes" title="多久自动存一次（推荐 5 分钟）">
+            <option value="5">5 分钟（推荐）</option>
             <option value="10">10 分钟</option>
             <option value="30">30 分钟</option>
           </select>
@@ -72,6 +72,8 @@
       <div class="plan-summary" id="autosnap-hint" hidden>
         名字里带 <b>-自动部分</b> 的那一份就是它：<b>只留最新一份</b>（写完新的再删旧的），
         所以不会成倍占空间。已经抓到的随时能播、能导出，中途出意外最多只丢最后这几分钟。<br />
+        <b>间隔推荐 5 分钟</b>：抓流的数据全在内存里，间隔越短、意外时丢的越少
+        （代价只是每次多写一点字节 —— 滚动覆盖所以始终只占一份空间）。<br />
         <b>按什么算</b>：<b>录制时间</b>＝你录了多久（防意外的口径，崩了最多丢这么多投入）；
         <b>视频内容时长</b>＝抓到的内容有多长 —— 你开了倍速播放时这两个差好几倍
         （4 倍速下"录制 10 分钟"其实内容有 40 分钟）。没有可读时间戳的流（WebM 那种）
@@ -93,12 +95,12 @@
       </div>
 
       <div class="field row" id="autocut-row" style="margin-top:12px" hidden>
-        <label for="autocut" title="抓流的数据全在内存里，收尾时合并要一整块内存；攒到阈值就先写出一段完整文件、清空缓冲接着抓，避免最后关头合不出来">
+        <label for="autocut" title="抓流的数据全在内存里，收尾时合并要一整块内存；攒到阈值就先写出一段完整文件、清空缓冲接着抓，避免最后关头合不出来。普通视频（一集到不了 600 MB）根本触发不了它；真正需要的是 4K / 高码率 —— 那种 10 分钟就 600 MB">
           抓流：攒太大自动切一段
         </label>
         <span style="display:flex;gap:8px;align-items:center">
           <span class="muted">到</span>
-          <select id="autocut-mb" title="攒到多大就切一段">
+          <select id="autocut-mb" title="攒到多大就切一段（内存小的机器建议 300 MB）">
             <option value="300">300 MB</option>
             <option value="600">600 MB</option>
             <option value="1200">1200 MB</option>
@@ -110,7 +112,14 @@
         抓流的数据<b>全在内存里</b>，收尾时合并还需要一整块（实测抓到的超过 ~1 GB 就合不出来了，
         那时只能全丢）。所以到阈值就先写出一段<b>完整文件</b>、清空缓冲接着抓 ——
         代价是<b>一个视频会分成几个文件</b>（名字带 <b>-2</b>、<b>-3</b>，按顺序就是完整内容）。
-        关掉它的话，接近阈值时会提前提醒你手动「先保存已录到的部分」。
+        关掉它的话，接近阈值时会提前提醒你手动「先保存已录到的部分」。<br />
+        <b>这个扩展是按 32 GB 内存的机器设计的</b>：600 MB 阈值 ≈ 收尾合并时峰值 1.8 GB。
+        内存小的机器请把这里调到 <b>300 MB</b>、把上面「自动保存」调到 <b>5 分钟</b>，
+        或者干脆改用「录制」。<br />
+        <b>普通视频用不到它</b>（一集到不了 600 MB，开着也不会触发、不会把文件切开）；
+        真正需要的是 <b>4K / 高码率</b>。⚠️ <b>0.2.1 及更早</b>的版本上，一旦触发切段，
+        <b>第二段会没有声音</b>（借初始化段借错了，<b>0.2.2 已修</b>）——
+        老版本上跑大文件请留意。
       </div>
     </section>
 

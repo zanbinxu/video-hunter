@@ -193,6 +193,16 @@ body { display: flex; flex-direction: column; max-height: 600px; }
 .field.stack select { width: auto; flex: 1 1 0; min-width: 0; max-width: 190px; }
 .field.stack .controls > :last-child { flex: none; }
 
+/* 设置面板里"要让人一眼看见、但又不该占一整行控件位"的说明
+ * （内存假设、推荐值、老版本的已知问题）。整段可读，不挤成一条。 */
+.field-note {
+  margin: 2px 0 4px;
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.field-note b { color: var(--text, #e6e6e6); font-weight: 600; }
+
 /* ---------- 两种模式怎么选（收在问号里，悬停/聚焦才浮出来） ---------- */
 /*
  * 这两个模式的代价差别很大（一个无损、一个重编码），所以说明要写得清楚；

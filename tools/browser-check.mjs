@@ -3762,7 +3762,7 @@ async function runExtensionExtras(cdp, extId, origin) {
       const got = await chrome.storage.local.get('vh:settings');
       const next = {
         ...(got['vh:settings'] || {}),
-        autoSnapshotMinutes: 10,
+        autoSnapshotMinutes: 5,
         autoSnapshotBasis: 'wall',
         autoExportCapture: true,
         downloadSubdir: 'VideoHunter',

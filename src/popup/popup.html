@@ -141,12 +141,12 @@
       <input type="checkbox" id="s-autosave" />
     </div>
     <div class="field row stack">
-      <label for="s-autosnap" title="抓流期间每隔一段时间，把已经录到的部分存成一个文件；只留最新一份，随时都有一份能播的">抓流：自动保存已录到的部分</label>
+      <label for="s-autosnap" title="抓流期间每隔一段时间，把已经录到的部分存成一个文件；只留最新一份，随时都有一份能播的。推荐 5 分钟：抓流的数据全在内存里，间隔越短、出意外时丢的越少">抓流：自动保存已录到的部分</label>
       <!-- 这一行有三个控件（间隔 + 口径 + 开关），420px 的弹窗里横着放会把标签挤成竖排，
            所以用 .stack（标签独占一行、控件下一行）—— 详见 popup.css 里的量测注释 -->
       <span class="controls">
-        <select id="s-autosnap-minutes" title="多久自动存一次">
-          <option value="5">5 分钟</option>
+        <select id="s-autosnap-minutes" title="多久自动存一次（推荐 5 分钟：间隔越短，出意外时丢的越少）">
+          <option value="5">5 分钟（推荐）</option>
           <option value="10">10 分钟</option>
           <option value="30">30 分钟</option>
         </select>
@@ -162,9 +162,9 @@
       <input type="checkbox" id="s-autoexport" />
     </div>
     <div class="field row stack">
-      <label for="s-autocut" title="抓流的数据全在内存里，收尾合并还要一整块内存；攒到阈值就先写出一段完整文件、清空缓冲接着抓，避免最后关头合不出来（那时只能全丢）。代价是一个视频会分成几个文件。">抓流：攒太大自动切一段</label>
+      <label for="s-autocut" title="抓流的数据全在内存里，收尾合并还要一整块内存；攒到阈值就先写出一段完整文件、清空缓冲接着抓，避免最后关头合不出来（那时只能全丢）。代价是一个视频会分成几个文件。普通视频（一集到不了 600 MB）根本触发不了它；真正需要的是 4K / 高码率 —— 那种 10 分钟就 600 MB">抓流：攒太大自动切一段</label>
       <span class="controls">
-        <select id="s-autocut-mb" title="攒到多大就切一段">
+        <select id="s-autocut-mb" title="攒到多大就切一段（内存小的机器建议 300 MB）">
           <option value="300">300 MB</option>
           <option value="600">600 MB</option>
           <option value="1200">1200 MB</option>
@@ -172,6 +172,15 @@
         <input type="checkbox" id="s-autocut" />
       </span>
     </div>
+    <!-- 这一段是"要让人看见、但不能只藏在悬停提示里"的说明（用户要求的）：
+         内存假设 + 推荐值 + 老版本的已知问题 -->
+    <p class="field-note">
+      抓流的数据<b>全在内存里</b>，本扩展按 <b>32 GB 内存</b>的机器设计：600 MB 阈值 ≈ 收尾合并时
+      峰值 1.8 GB。内存小的机器建议把上面两项调小（自动保存 5 分钟 / 自动切段 300 MB），
+      或者干脆用「录制」。<br>
+      普通视频（一集到不了 600 MB）用不到「自动切一段」；<b>0.2.1 及更早</b>的版本上，
+      一旦触发切段，<b>第二段会没有声音</b>（0.2.2 已修）。
+    </p>
     <div class="field row">
       <label for="s-fromcurrent" title="点「抓流」时从视频当前播到的那一秒接着抓（仍然会刷新一次页面，但不用重看）。关掉就每次都从头抓一份完整的。">抓流：从当前播放位置开始</label>
       <input type="checkbox" id="s-fromcurrent" />
