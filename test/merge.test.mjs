@@ -13,7 +13,7 @@ import { readFileSync, statSync } from 'node:fs';
 import { parseMpd, selectRepresentations } from '../src/parser/dash.js';
 import {
   mergeFmp4, parseInitSegment, extractSegmentSamples, describeMergeInput,
-  parseAudioSpecificConfig,
+  parseAudioSpecificConfig, normalizeTrackSamples,
 } from '../src/parser/mp4-merge.js';
 import { createTsRemuxer } from '../src/parser/remuxer.js';
 import { splitSelfContainedFmp4 } from '../src/parser/fmp4-file.js';
@@ -672,3 +672,40 @@ function retargetFragment(bytes, trackId) {
   copy[p + 3] = trackId & 0xff;
   return copy;
 }
+
+/* ------------------------------------------------------------------ *
+ * 同页换集：把**当前的真实行为**钉住
+ * ------------------------------------------------------------------ */
+
+/**
+ * 这条用例钉的不是"理想行为"，而是**现在确实会发生什么**，因为它是用户
+ * 实测报上来的那个现象的机制（见 README 的「已知限制」和 docs/verification.md
+ * 第十三轮之后的讨论）：
+ *
+ *   · 站点在**同一个页面、地址栏都不变**的情况下平滑换集时，我们盯的四个
+ *     边界信号（`ended` / `emptied` / `loadstart` / 新的 `SourceBuffer`）
+ *     一个都不会来 → **不会自动切片**；
+ *   · 而下一集的解码时间戳从 0 重新开始，和上一集完全重叠 → 按 DTS 整理时
+ *     "整段都落在已收内容里"的样本会被判成重复丢掉；
+ *   · 于是产物**恰好是一集**（这就是用户看到的"第二集的开头没录上去，挺好"）；
+ *   · 但下一集**比上一集长**时，超出上一集末尾的那部分**会被静默接在文件尾部**
+ *     —— 中间没有空洞，所以事后连"体检"都查不出来。
+ *
+ * 为什么值得钉住：将来谁去改边界识别，都必须先看到这条用例、明确知道自己在
+ * 改变什么。去掉它之前，请先想清楚用户要的是"一集一个文件"还是别的。
+ */
+test('同页换集：第二集与第一集重叠的样本被丢掉，超出末尾的会被接上（当前真实行为）', () => {
+  const ep = (n) => Array.from({ length: n }, (_, i) => ({ dts: i * 100, duration: 100, data: null }));
+
+  // 第一集 4 个样本（0/100/200/300），第二集 6 个样本（0/100/200/300/400/500）
+  const { samples, dropped } = normalizeTrackSamples([...ep(4), ...ep(6)]);
+
+  // 前 4 个来自第二集、但和第一集完全重叠 → 丢掉；第二集多出来的 400/500 被接上
+  assert.equal(dropped, 4);
+  assert.deepEqual(samples.map((s) => s.dts), [0, 100, 200, 300, 400, 500]);
+
+  // 换一个更短的"第二集"：全部重叠 → 产物理所当然只有第一集（用户看到的"干净的一集"）
+  const shorter = normalizeTrackSamples([...ep(4), ...ep(2)]);
+  assert.deepEqual(shorter.samples.map((s) => s.dts), [0, 100, 200, 300]);
+  assert.equal(shorter.dropped, 2);
+});

@@ -76,7 +76,17 @@
     const now = Date.now();
     if (boundaryTimer && now - boundaryTimer < 1500) return;
     boundaryTimer = now;
-    chrome.runtime.sendMessage({ type: MSG.MSE_BOUNDARY, reason }).catch(() => {});
+    // ⚠️ 但**上报没成功**时要把窗口放开。换集往往在几百毫秒里连发好几个信号
+    // （`loadstart` / `emptied` / 新的 SourceBuffer），而"第一条被后台拒了"时
+    // —— 最常见的原因是这一段的数据还不够收尾（`skipped`）—— 后面那几条
+    // 就是唯一的补救机会；本地这道窗口比后台的更严，就会把它一起吃掉，
+    // 结果那一集什么都没存，界面上还看不出任何异常。
+    // 后台那边只在**真的切成功**之后才启动它自己的去重窗口（见 cutMseCapture）。
+    chrome.runtime.sendMessage({ type: MSG.MSE_BOUNDARY, reason })
+      .then((res) => {
+        if (res && res.ok === false) boundaryTimer = null;
+      })
+      .catch(() => { boundaryTimer = null; });
   }
 
   function watchBoundaries() {

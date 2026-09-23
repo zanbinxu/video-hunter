@@ -3773,6 +3773,152 @@ async function runExtensionExtras(cdp, extId, origin) {
     if (mediaTarget) await cdp.send('Target.closeTarget', { targetId: mediaTarget }).catch(() => {});
   }
 
+  /* ---- 8b-4. 「攒太大自动切一段」那条路也必须自动导出 ----
+   *
+   * 这一条有明确的来历：自动切段是**离屏文档自己发起**的（体积到阈值是它每秒
+   * 在算），没有"请求-响应"这条路可借，于是它把导出句柄塞进状态推给 service
+   * worker —— 而 service worker 一开始**根本没人接**。后果不是报错，而是
+   * "什么都没发生"：切出来的那一段永远不落到下载目录，界面上也看不出任何区别，
+   * 用户以为文件在下载目录里，其实只在扩展私有存储里。
+   *
+   * 怎么验：开自动导出 + 阈值压到 0.05 MB → 喂到阈值 → 切段 → 去浏览器下载记录里
+   * 找那一份（名字从切段提示里取），**并且**要求状态里出现"已导出"的提示 ——
+   * 文件导出去了却没有提示，用户仍然不知道发生了什么。
+   */
+  let cutExport = null;
+  let cutExportTarget = null;
+  try {
+    await evalIn(cdp, control.sessionId, `(async () => {
+      const got = await chrome.storage.local.get('vh:settings');
+      await chrome.storage.local.set({ 'vh:settings': { ...(got['vh:settings'] || {}),
+        autoCutCapture: true, autoCutMb: 0.05,
+        autoExportCapture: true, downloadSubdir: 'VideoHunterAutoTest',
+        autoSnapshotCapture: false } });
+      return 'ok';
+    })()`);
+
+    const pageUrl = `${origin}/__page/mse`;
+    const created = await cdp.send('Target.createTarget', { url: pageUrl });
+    cutExportTarget = created.result?.targetId;
+    await sleep(1800);
+    const tabId = await evalIn(cdp, control.sessionId, `(async () => {
+      const tabs = await chrome.tabs.query({ url: ${JSON.stringify(pageUrl)} });
+      return tabs.length ? tabs[0].id : null;
+    })()`);
+    if (!Number.isInteger(tabId)) throw new Error('找不到 MSE 测试页的标签页');
+
+    cutExport = JSON.parse(await evalIn(cdp, control.sessionId, `(async () => {
+      const toB64 = (u8) => {
+        let s = '';
+        const CH = 0x8000;
+        for (let i = 0; i < u8.length; i += CH) s += String.fromCharCode.apply(null, u8.subarray(i, i + CH));
+        return btoa(s);
+      };
+      const load = async (p) => new Uint8Array(await (await fetch(${JSON.stringify(origin)} + p)).arrayBuffer());
+      const init = await load('/dash-split/init-stream0.m4s');
+      const frags = [];
+      for (const n of ['00001', '00002', '00003', '00004', '00005', '00006']) {
+        frags.push(await load('/dash-split/chunk-stream0-' + n + '.m4s'));
+      }
+      const started = await chrome.runtime.sendMessage({ type: 'vh:mse-start', tabId: ${tabId} });
+      if (!started.ok) return JSON.stringify({ ok: false, error: started.error });
+      await chrome.runtime.sendMessage({ type: 'vh:mse-buffer', seq: 0, mime: 'video/mp4; codecs="avc1.64001e"', base64: toB64(init) });
+      for (const [i, c] of frags.entries()) {
+        await chrome.runtime.sendMessage({ type: 'vh:mse-buffer', seq: i + 1, mime: 'video/mp4', base64: toB64(c) });
+      }
+      // 心跳每秒判一次体积 → 到阈值就切 → 导出是异步的（等下载器写完）。
+      // ⚠️ 状态里的 captureNotice 有**两条**：快到阈值时的预告（**没有文件名**）
+      // 和真正切段之后那条（带文件名）。第一版只看 captureNotice 又用"没出现过就
+      // 记下来"锁死，结果锁在预告上、名字永远是空 —— 所以这里按"这条是不是切段那条"挑，
+      // 并且**以导出提示里的文件名为准**（那才是下载器真的写出去的那一份）。
+      let notice = null;
+      let exportNotice = null;
+      let name = null;
+      let exportName = null;
+      let download = null;
+      for (let i = 0; i < 30; i += 1) {
+        await new Promise((r) => setTimeout(r, 500));
+        const st = (await chrome.runtime.sendMessage({ type: 'vh:record-state' }))?.state || {};
+        if (st.captureNotice && /先存下一段完整文件/.test(st.captureNotice)) {
+          notice = st.captureNotice;
+          const m = String(notice).match(/（(vh-mse-[^）]+)）/);
+          if (m) name = m[1];
+        }
+        if (st.exportNotice) {
+          exportNotice = st.exportNotice;
+          const m = String(exportNotice).match(/已导出到下载目录：(.+?)\s*$/);
+          if (m) exportName = m[1];
+        }
+        const target = name || exportName;
+        if (target && !download) {
+          const found = await chrome.downloads.search({ query: [target] });
+          const done = found.find((d) => d.state === 'complete');
+          if (done) download = { filename: done.filename, bytes: done.fileSize || done.totalBytes };
+        }
+        if (download && exportNotice) break;
+      }
+      // 收尾：不然下一次点「抓流」会被告知"还在进行中"
+      const stopped = await chrome.runtime.sendMessage({ type: 'vh:mse-stop' });
+      return JSON.stringify({
+        notice, exportNotice, name, exportName, download, stoppedOk: stopped?.ok === true,
+      });
+    })()`, { timeout: 180000 }));
+  } catch (err) {
+    console.error(`  ✗ 自动切段的自动导出用例失败：${err.message}`);
+    problems += 1;
+  } finally {
+    // 收摊：产物、索引、下载记录、设置全清掉（和上一个用例同一套理由）
+    await evalIn(cdp, control.sessionId, `(async () => {
+      const root = await navigator.storage.getDirectory();
+      const names = [];
+      for await (const [name] of root.entries()) names.push(name);
+      const mine = names.filter((n) => /视频|MSE/.test(n));
+      for (const n of mine) { try { await root.removeEntry(n); } catch { /* 已经不在了 */ } }
+      const key = 'vh:media-index';
+      const index = (await chrome.storage.local.get(key))[key] || {};
+      for (const n of mine) delete index[n];
+      await chrome.storage.local.set({ [key]: index });
+      const found = await chrome.downloads.search({});
+      for (const d of found) {
+        if (String(d.filename).includes('VideoHunterAutoTest')) await chrome.downloads.erase({ id: d.id });
+      }
+      const got = await chrome.storage.local.get('vh:settings');
+      await chrome.storage.local.set({ 'vh:settings': { ...(got['vh:settings'] || {}),
+        autoCutMb: 600, autoSnapshotCapture: true, downloadSubdir: 'VideoHunter' } });
+      return 'ok';
+    })()`).catch(() => {});
+    for (const f of [cutExport?.download?.filename].filter(Boolean)) {
+      try { unlinkSync(f); } catch { /* 已经不在了 */ }
+    }
+    // 下载对象没拿到时（判据失败那次），也按提示里的文件名去测试目录里清一遍 ——
+    // 用例自己造的文件必须在用例里清干净，不能留给用户的下载目录
+    for (const bare of [cutExport?.name, cutExport?.exportName].filter(Boolean)) {
+      try { unlinkSync(join(homedir(), 'Downloads', 'VideoHunterAutoTest', String(bare))); } catch { /* 已经不在了 */ }
+    }
+    try {
+      const dir = join(homedir(), 'Downloads', 'VideoHunterAutoTest');
+      if (existsSync(dir) && readdirSync(dir).length === 0) rmdirSync(dir);
+    } catch { /* 目录可能还有别的东西，留着 */ }
+    if (cutExportTarget) await cdp.send('Target.closeTarget', { targetId: cutExportTarget }).catch(() => {});
+  }
+
+  if (cutExport && cutExport.ok !== false) {
+    const cutName = cutExport.name || cutExport.exportName || '（没解析到名字）';
+    console.log(`  · 自动切段那条路的导出：切出「${cutName}」｜`
+      + `状态里的提示=「${String(cutExport.exportNotice || '（没有提示）').slice(0, 56)}」`);
+    if (!cutExport.download) {
+      console.error('  ✗ 自动切段切出来的那一份没落到下载目录 —— service worker 又漏接了那个句柄'
+        + '（用户以为文件在下载目录里，实际只在扩展私有存储里）');
+      problems += 1;
+    } else if (!/已导出到下载目录/.test(String(cutExport.exportNotice))) {
+      console.error('  ✗ 文件确实导出去了，但界面上没有任何提示（用户看不到"已导出"）：'
+        + `${JSON.stringify(cutExport.exportNotice)}`);
+      problems += 1;
+    } else {
+      console.log('  ✓ 自动切段那条路：产物落到了下载目录，而且界面上说了"已导出"');
+    }
+  }
+
   /* ---- 8c. 抓流 + WebM/Opus 音频：产物里必须有声音 ----
    *
    * 用户报的：「抓 YouTube 的视频可以抓到画面，但是抓不到声音。」

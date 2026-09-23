@@ -1,6 +1,6 @@
 {
   "name": "video-hunter",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "type": "module",
   "description": "浏览器媒体嗅探 + 直链下载 + HLS/TS 合并 + DASH 音视频合并 + 录制兜底",

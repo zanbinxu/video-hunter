@@ -21,6 +21,8 @@ const state = {
   recordTimer: null,
   /** 已经弹过的"抓流进行中"提示（快到切段阈值 / 刚切了一段），用于判重 */
   noticeSeen: null,
+  /** 已经弹过的"自动导出结果"（成功/失败各一句），用于判重 */
+  exportSeen: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -452,6 +454,15 @@ function renderRecording() {
     toast(r.captureNotice);
   }
 
+  // 自动导出的结果：成功/失败都要当场说一句。以前这件事只写在 service worker 的
+  // 控制台里，用户唯一的办法是去下载目录里翻 —— 翻不到也分不清是"导出失败了"
+  // 还是"这个开关根本没开"。这里**不看 stage**：收尾那条路上，这一句是在
+  // 「正在收尾」阶段写进状态的，等它变成"完成"就已经错过了。
+  if (r?.exportNotice && r.exportNotice !== state.exportSeen) {
+    state.exportSeen = r.exportNotice;
+    toast(r.exportNotice, r.exportOk === false);
+  }
+
   if (stage !== RECORD_STAGE.RECORDING && stage !== RECORD_STAGE.FINALIZING) {
     bar.hidden = true;
     if (state.recordTimer) { clearInterval(state.recordTimer); state.recordTimer = null; }
@@ -476,12 +487,24 @@ function renderRecording() {
     : (isMse ? '抓流中' : '录制中');
   // 抓流是"边播边收"，必须让用户看到它确实在动 —— 只有一个转圈的计时器
   // 时，没法区分"在收"和"卡死了"。段数就是这个心跳。
-  // 换集会自动另存一个文件，所以还要显示"已经存了几个"。
+  //
+  // 这里要把**两个**容易被读错的数分开写（用户实测就这么误会过）：
+  //   · 完整 N 段 = 已经收尾成独立文件的（换集 / 停止 / 攒太大自动切段）
+  //   · 快照 M 份 = 滚动自动保存的那一份（每 N 分钟覆盖，只留最新）
+  // 以前只写"已存 N 个"，N=0 时用户以为"什么都没存"，而其实快照就在管理页里。
   const parts = r?.parts || stats.parts || 0;
+  const snaps = stats.autoSnapshot ? 1 : 0;
   const progress = isMse
-    ? (stats.chunks ? ` · ${stats.chunks} 段${parts ? ` · 已存 ${parts} 个` : ''} · ${formatBytes(stats.bytes || 0)}` : '')
+    ? (stats.chunks
+      ? ` · ${stats.chunks} 段 · 完整 ${parts} 段${snaps ? ` · 快照 ${snaps} 份` : ''} · ${formatBytes(stats.bytes || 0)}`
+      : '')
     : ` · ${stats.frames ?? 0} 帧`;
   $('rec-text').textContent = `${label} ${formatClock(elapsed)}${progress}`;
+  // 数字的含义放在悬停提示里：面板只有 420px 宽，塞不下解释
+  $('rec-text').title = isMse
+    ? '完整 = 已经收尾成独立文件的段数（换集、停止、攒太大自动切段都会多一段）；\n'
+      + '快照 = 滚动自动保存的那一份（每 N 分钟覆盖一次，只留最新）'
+    : '';
 }
 
 function finishedToastText(r, real) {

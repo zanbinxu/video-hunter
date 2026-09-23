@@ -24,7 +24,7 @@ import { sanitizeSegment } from '../core/filename.js';
 import { getSettings, setSettings } from '../core/settings.js';
 import { createMediaIndex } from '../core/media-index.js';
 import { describeStorageUse } from '../core/storage-error.js';
-import { isAutoSnapshotName } from '../core/capture-limits.js';
+import { captureFileKind } from '../core/capture-limits.js';
 import { inspectSeekability, repairTimelineGaps, readMovieDurationSeconds } from '../parser/seek-check.js';
 
 const $ = (id) => document.getElementById(id);
@@ -48,6 +48,8 @@ const state = {
   warningSeen: null,
   /** 已经播报过的"抓流进行中"提示（快到切段阈值 / 刚切了一段） */
   captureNoticeSeen: null,
+  /** 已经播报过的"自动导出结果"（成功/失败各一句） */
+  exportNoticeSeen: null,
 };
 
 /* ------------------------------------------------------------------ *
@@ -344,6 +346,22 @@ function formatDuration(seconds) {
   return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
 }
 
+/**
+ * 一条产物属于哪一类 —— 列表里要看得懂，不能只靠用户自己读文件名。
+ *
+ * 三类混在同一个列表里、名字只差几个字（`-部分` / `-自动部分` / 什么都不带），
+ * 含义却完全不同：完整的一段可以放心收着；`-部分` 是**中途**拿走的那份（后面还有）；
+ * `-自动部分` 那份会被下一次自动保存覆盖。判断只按文件名（见 captureFileKind），
+ * 不依赖内存里的记录 —— 浏览器重启后照样成立。
+ */
+function captureKindText(name, kind) {
+  if (kind === MEDIA_KIND.RECORD || String(name).startsWith(REC_PREFIX)) return '';
+  const k = captureFileKind(name);
+  if (k === 'autoSnapshot') return '自动保存（每 N 分钟更新，只留最新一份）';
+  if (k === 'partial') return '未播完时先存的一份（-部分）';
+  return '完整的一段';
+}
+
 function mediaRow(item) {
   const row = document.createElement('div');
   row.className = 'variant';
@@ -372,8 +390,9 @@ function mediaRow(item) {
     new Date(item.lastModified).toLocaleString(),
     // 「已导出」是清理时的凭据：用户不会想删掉自己还没拿出来过的东西
     item.exportedAt ? '已导出到磁盘' : '',
-    // 自动保存的那一份会被下一份覆盖 —— 说清楚，免得用户发现它"不见了"以为出问题
-    isAutoSnapshotName(item.name) ? '自动保存（每 N 分钟更新，只留最新一份）' : '',
+    // 这条属于哪一类必须写在行里：三类文件混在一个列表里，名字只差几个字
+    // （`-部分` / `-自动部分` / 什么都不带），用户实测会当成同一批东西。
+    captureKindText(item.name, item.kind),
   ].filter(Boolean);
   meta.textContent = parts.join(' · ');
   if (!durationText) meta.style.opacity = '.7';
@@ -637,10 +656,13 @@ function render() {
   $('st-frames').textContent = isMse
     ? (stats.chunks ? `${stats.chunks} 段数据` : '抓流（不重编码）')
     : `${r?.frames ?? stats.frames ?? 0} 帧`;
+  // 这一格在抓流时说清**两个**数（用户实测把"已存 0 个"读成了"什么都没存"：
+  // 而那时滚动自动保存的快照其实已经躺在管理页里了）：
+  //   完整 N 段 = 已经收尾成独立文件的（换集 / 停止 / 攒太大自动切段）
+  //   快照 M 份 = 滚动自动保存的那一份（每 N 分钟覆盖，只留最新）
+  const snaps = isMse && stats.autoSnapshot ? 1 : 0;
   $('st-dropped').textContent = isMse
-    // 抓流时这一格显示"已经自动存了几段"—— 换集就会多一段，
-    // 用户一眼能看出播放列表被拆成了几个文件
-    ? `已存 ${r?.parts ?? stats.parts ?? 0} 个`
+    ? `完整 ${r?.parts ?? stats.parts ?? 0} 段${snaps ? ` · 快照 ${snaps} 份` : ''}`
     : `丢帧 ${r?.dropped ?? stats.dropped ?? 0}`;
   $('st-size').textContent = formatBytes(r?.size ?? stats.bytes ?? 0);
   $('st-codec').textContent = r?.info
@@ -1068,6 +1090,16 @@ async function init() {
         log(msg.state.captureNotice, 'ok');
         showNotice('ok', '抓流进行中', msg.state.captureNotice);
         refreshMedia();
+      }
+      // 自动导出的结果：**成功也记一行**（产物到底有没有落到下载目录，用户有权知道），
+      // 失败再额外弹一条横幅 —— 失败要给出下一步，而产物本身还在管理页里。
+      // 这件事以前只写在 service worker 的控制台里，界面上一个字都没有。
+      const exportNotice = msg.state?.exportNotice;
+      if (exportNotice && exportNotice !== state.exportNoticeSeen) {
+        state.exportNoticeSeen = exportNotice;
+        const exportOk = msg.state?.exportOk !== false;
+        log(exportNotice, exportOk ? 'ok' : 'warn');
+        if (!exportOk) showNotice('warn', '自动导出没成功', exportNotice);
       }
       // 自动保存失败（多半是空间不够）—— 这是"配额要满了"的早期信号，
       // 现在知道总比收尾时才知道好。

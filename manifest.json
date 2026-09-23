@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Video Hunter",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "网页媒体嗅探 + 直链下载 + HLS/TS 分片合并 + DASH 音视频合并 + 录制兜底，全流程本地完成。",
   "minimum_chrome_version": "116",
   "icons": {

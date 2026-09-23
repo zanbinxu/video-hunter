@@ -244,6 +244,25 @@ async function getRecording() {
   }
 }
 
+/**
+ * 只改几个字段，其余以**最新**状态为准，然后把新状态推给界面。
+ *
+ * 为什么需要它（不是洁癖，是踩过的坑）：收尾那条路上会连着写好几次状态，
+ * 而每次用来拼下一个状态的 `cur` 都是函数开头读的**快照**。一旦中途别的地方
+ * 往里写了新字段（典型的就是"自动导出的结果"—— 它要等下载器写完，耗时以秒计），
+ * 后面那次用旧快照的写入就会把它悄悄抹掉，用户永远看不到。
+ *
+ * @param {object} patch 要覆盖的字段
+ * @returns {Promise<object>} 写进去的完整状态
+ */
+async function patchRecording(patch) {
+  const cur = (await getRecording()) || {};
+  const next = { ...cur, ...patch, updatedAt: Date.now() };
+  await setRecording(next);
+  notify({ type: MSG.RECORD_STATE_PUSH, state: next });
+  return next;
+}
+
 async function closeOffscreen() {
   try {
     const has = await chrome.offscreen.hasDocument();
@@ -492,6 +511,13 @@ async function onOffscreenState(msg) {
   };
   await setRecording(next);
   notify({ type: MSG.RECORD_STATE_PUSH, state: next });
+
+  // ⚠️ 「攒太大自动切一段」那条路也会把导出句柄推过来：那一步是**离屏文档自己
+  // 发起的**（体积到阈值是它每秒在算），没有"请求-响应"这条路可借，所以句柄
+  // 跟着状态一起送过来 —— **这里必须接**。不接的后果不是报错，而是"什么都没发生"：
+  // 切出来的那一段永远不会落到下载目录，界面上也看不出任何区别（这条漏过很久）。
+  // 顺序也要紧：放在关离屏文档之前 await，blob 就活在那个文档里。
+  if (msg.autoExport) await autoExportProduct(msg.autoExport);
 
   // 采集结束后离屏文档就没用了，关掉省资源。
   // ⚠️ 用 idle 版：自动导出的 blob 就活在这个文档里，**下载没写完不能关**
@@ -798,7 +824,8 @@ async function cutMseCapture(reason) {
 
   // 换集切出来的是一份**完整视频** —— 开了自动导出就落一份到下载目录
   // （blob 句柄由离屏文档保持，所以这里 await，别让文档提前关）
-  if (res.autoExport) await runAutoExport(res.autoExport);
+  // 走统一入口：导出 + 把成功/失败写进状态，界面才看得见（见 autoExportProduct）
+  await autoExportProduct(res.autoExport);
 
   // ⚠️ 只有**真的切成功了**才启动静默窗口。
   // 反过来的写法踩过：先把 lastCutAt 记下来再切，结果一次失败（曾经是
@@ -806,12 +833,10 @@ async function cutMseCapture(reason) {
   // 全被忽略 —— 用户看到的是"明明换了视频却什么都没存"。
   lastCutAt = now;
 
-  const next = {
-    ...cur,
+  await patchRecording({
     parts: res.part,
     lastCut: { fileName: res.fileName, mediaSeconds: res.mediaSeconds, part: res.part, at: now },
-    updatedAt: now,
-  };
+  });
   // 索引统一在这里写（离屏文档没有 chrome.storage）
   await rememberProduct({
     name: res.fileName,
@@ -819,14 +844,11 @@ async function cutMseCapture(reason) {
     seconds: res.mediaSeconds,
     size: res.size,
   });
-  await setRecording(next);
-  notify({ type: MSG.RECORD_STATE_PUSH, state: next });
   // 刚切完缓冲是空的，此时的心跳还停在上一次的段数上 —— 记下来，
   // 空闲判断要用（见 maybeFinishIdleCapture）
   idleBaseline = { chunks: 0, since: now };
   return res;
 }
-
 /**
  * 换集之后如果一直没再抓到新数据，就自动收尾。
  *
@@ -919,6 +941,48 @@ async function runAutoExport(handle) {
 }
 
 /**
+ * 抓流产物落盘之后，**唯一**的自动导出入口。
+ *
+ * ## 为什么必须只有一处
+ *
+ * 发起方有四个：换集切段、停止收尾、手动快照、攒太大自动切段。
+ * "各调用各的"这种写法已经漏过一次 —— 自动切段那条路上，离屏文档明明把句柄
+ * 推过来了（状态里的 `autoExport`），SW 的 `onOffscreenState` 却没人接：
+ * 产物只在扩展私有存储里，用户以为它已经在下载目录里了，界面上也一个字都没说。
+ *
+ * 所以导出和**"把结果说出来"**都收在这一处。以前只有 `console.info` ——
+ * 对用户来说"产物自动导出"这件事等于不存在：他只能自己去下载目录里翻，
+ * 翻不到也分不清是失败了还是压根没做。
+ *
+ * @param {{url:string,name:string,size?:number,subdir?:string}|null} handle
+ *   离屏文档给的 blob 句柄（blob 活在离屏文档里，所以调用方**不能**提前关它）
+ * @returns {Promise<{ok:boolean,notice:string|null,name?:string,error?:string}>}
+ */
+async function autoExportProduct(handle) {
+  if (!handle?.url || !handle?.name) {
+    return { ok: false, notice: null, error: '没有可导出的句柄' };
+  }
+  const res = await runAutoExport(handle);
+  const notice = res?.ok
+    ? `已导出到下载目录：${res.name}`
+    : `自动导出没能完成：${res?.error || '未知原因'}`
+      + ' —— 产物本身没丢，它还在管理页的「抓流文件」里，点「保存到磁盘」可以再导一次。';
+  // 只在**当前确实有录制状态**时写提示：没有状态时凭空写一条会让界面读到
+  // 一个没有 stage 的"状态"。写入用 patch（导出期间每秒心跳还在写状态，
+  // 整份覆盖会把别的新字段抹掉 —— 见 patchRecording 的注释）。
+  // ⚠️ 写状态失败**不能**把整条收尾/切段带崩（这里只记一句、照常返回结果）：
+  // 导出已经完成了，提示写不进去是小事，报错弹红反而是大事。
+  try {
+    if (await getRecording()) {
+      await patchRecording({ exportNotice: notice, exportOk: res?.ok === true });
+    }
+  } catch (err) {
+    console.info('[vh/sw] 自动导出的结果没能写进状态（不影响导出本身）：', err?.message || err);
+  }
+  return { ...res, notice };
+}
+
+/**
  * 关离屏文档，但**有自动导出在跑就先等着**。
  *
  * 这是"blob 属于离屏文档"这条约束的落点：宁可晚关几秒，
@@ -1003,8 +1067,9 @@ async function runStopMseCapture(cur, options = {}) {
   // 收尾产出的是一份**完整产物** —— 开了自动导出就落一份到下载目录。
   // ⚠️ 必须**在关离屏文档之前**做：那个 blob URL 活在这个文档里，
   // 关早了下载会断在半路（这条漏过一次：切段/快照都接了，唯独收尾这条没接，
-  // 而收尾恰恰是最常走的那条路）。
-  if (res?.ok && res.autoExport) await runAutoExport(res.autoExport);
+  // 而收尾恰恰是最常走的那条路）。结果里的 `notice` 要跟着最终状态写出去，
+  // 否则用户永远看不到"到底导出去没有"。
+  const exportRes = res?.ok ? await autoExportProduct(res.autoExport) : null;
   // 自动导出的 blob 也活在离屏文档里 —— 等它写完再关（见 closeOffscreenWhenIdle）
   if (!awaitingRetry) await closeOffscreenWhenIdle();
   // 钩子只在该抓的时候挂在页面上，结束就注销 —— 别留在用户页面里
@@ -1081,6 +1146,10 @@ async function runStopMseCapture(cur, options = {}) {
     warnings: [...(res.warnings || []), ...(await lostChunkWarnings(cur.tabId))],
     detail: res.detail,
     error: null,
+    // 自动导出的结果（成功/失败都有一句）—— 收尾是用户最常走的那条路，
+    // "文件到底有没有落到下载目录"必须当场说清楚，不能只写进控制台
+    exportNotice: exportRes?.notice ?? null,
+    exportOk: exportRes ? exportRes.ok === true : null,
     updatedAt: Date.now(),
   };
   // 索引在这里写：**离屏文档没有 chrome.storage**，它写的索引从来没生效过。
@@ -1222,10 +1291,10 @@ async function handleMessage(msg, sender) {
             size: res.size,
           });
           // 用户明确点了「先保存已录到的部分」→ 开了自动导出就一起落到下载目录
-          if (res.autoExport) await runAutoExport(res.autoExport);
-          notify({
-            type: MSG.RECORD_STATE_PUSH,
-            state: { ...cur, lastSnapshot: { fileName: res.fileName, mediaSeconds: res.mediaSeconds, at: Date.now() } },
+          // （统一入口：导出 + 把结果写进状态；下面的 patch 不会把它抹掉）
+          await autoExportProduct(res.autoExport);
+          await patchRecording({
+            lastSnapshot: { fileName: res.fileName, mediaSeconds: res.mediaSeconds, at: Date.now() },
           });
         }
         return res;
