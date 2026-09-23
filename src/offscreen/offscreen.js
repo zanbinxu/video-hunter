@@ -315,6 +315,9 @@ function mseStart(msg = {}) {
     // 用途见 assembleMseCapture 里的注释：播放器中途重建 SourceBuffer 时
     // 可能只补分片、不再补 init，而我们其实早就见过它了。
     seenInit: new Map(),
+    // WebM 的头部（Tracks）单独记：切段清空缓冲之后播放器不会重发它，
+    // 而媒体是 WebM/Opus 时那条路就是音频（见 assembleMseCapture 里的分支）
+    seenWebmHeader: new Map(),
     // 每条流（分组键 → video/audio）先前分析出来的大类：给"只有分片"的那一组
     // 认领初始化段时用（见 assembleMseCapture 里的注释）
     seenStreamType: new Map(),
@@ -804,9 +807,15 @@ function assembleMseCapture(s) {
   // 而 analyzeGroup 只看字节，不该反过来知道分组的 key。
   const analyzed = groups.map((g) => ({ ...analyzeGroup(g), mime: g.mime, sbId: g.sbId || '' }));
 
-  // 记住这次会话里见过的初始化段（按大类），后面要用。
+  // 记住这次会话里见过的初始化段，后面要用。**fMP4 和 WebM 分开存** —— 它们是两种
+  // 东西：fMP4 的是 moov（能读出 trackId），WebM 的是 EBML 头部（Tracks）。混在一起
+  // 会出事：WebM 头部里没有 moov，`listInitTrackIds` 读出空数组，万一被"借初始化段"
+  // 挑中，就变成一个没有任何轨道的组，静默消失。
   for (const a of analyzed) {
-    if (a.init) s.seenInit.set(a.contentType || 'video', a.init);
+    if (a.init) {
+      if (a.container === 'webm') s.seenWebmHeader.set(streamKeyOf(a), a.init);
+      else s.seenInit.set(a.contentType || 'video', a.init);
+    }
     // 这条流（按分组键：mime 或 sb:编号）**先前**被分析成什么大类 —— 这是给
     // "只有分片、没有初始化段"的那一组认领 init 时**最准**的线索：分组键在整个
     // 会话里是稳定的（同一个 SourceBuffer 的编号不会变），而真实站点上一批 append
@@ -814,10 +823,10 @@ function assembleMseCapture(s) {
     // 两条独立轨**都写 track 1**，撞号。
     if (a.init && a.contentType) s.seenStreamType.set(streamKeyOf(a), a.contentType);
   }
-  // 借初始化段的候选项 —— **每条轨的 trackId 都要带上**：自动切段会把缓冲清空，
-  // 而播放器不会重发 moov，后面那些"只有分片"的组只能借先前收到的那一份 init。
-  // 借哪一份**不能按 mime 猜**（真实站点上有一批 append 根本没有 mime），
-  // 只能按分片自己的 tfhd.track_ID 认（见 pickReusableInit 的注释）。
+  // 借初始化段的候选项（**只含真正的 fMP4 moov**）—— 每条轨的 trackId 都要带上：
+  // 自动切段会把缓冲清空，而播放器不会重发 moov，后面那些"只有分片"的组只能借
+  // 先前收到的那一份。借哪一份**不能按 mime 猜**，只能按分片自己的
+  // tfhd.track_ID 认（见 pickReusableInit 的注释）。
   const initCandidates = [...s.seenInit.entries()].map(([key, init]) => ({
     key,
     contentType: key,
@@ -853,6 +862,29 @@ function assembleMseCapture(s) {
     } else if (a.container === 'webm' && a.init && a.fragments && a.fragments.byteLength) {
       // WebM 单独处理：它要拆包 + （音频）转码，是异步的，不能在这儿做。
       webmGroups.push(a);
+    } else if (a.container === 'webm' && a.missingInit && a.raw) {
+      // 只有 Cluster、没有头部（Tracks）—— **切段会清空缓冲，而播放器不会重发 WebM 头部**。
+      // 媒体是 WebM/Opus 时（YouTube 那类）这条路就是**音频**：借不到头部就等于整条音轨没了。
+      // 用户报的「600 MB 自动切段之后那一段没有声音」在他那个站上就是这个原因：
+      // 第一段自带头部所以有声音，第二段只剩裸 Cluster —— 而 WebM 这条路原来**根本没有
+      // 借头部的地方**（fMP4 那条有 seenInit，WebM 这条没有），于是整组被静默丢掉。
+      const key = streamKeyOf(a);
+      const own = s.seenStreamType.get(key) || a.contentType || '';
+      let header = s.seenWebmHeader.get(key) || null;
+      if (!header && own) {
+        // 退一步：按大类找（键可能因为播放器重建了 SourceBuffer 而变过）
+        for (const [k, h] of s.seenWebmHeader) {
+          if (s.seenStreamType.get(k) === own) { header = h; break; }
+        }
+      }
+      if (header) {
+        // 借到了就交给下面 WebM 那条路（拆包 + Opus→AAC 转码）—— 它要求 init 和 fragments 都在
+        webmGroups.push({ ...a, init: header, fragments: a.raw, reusedInit: true });
+        reusedInit.push(own || 'audio');
+      } else {
+        reuseNotes.push('有一组只有 WebM 的裸 Cluster、没有头部（Tracks），本次会话里也没有'
+          + `可借的 —— 这一组 ${a.raw.byteLength} 字节没有进产物`);
+      }
     } else if (a.init && a.fragments && a.fragments.byteLength) {
       tracks.push({
         init: a.init,

@@ -4024,6 +4024,174 @@ async function runExtensionExtras(cdp, extId, origin) {
     }
   }
 
+  /* ---- 8b-5. 切段之后那一段必须有声音（WebM/Opus 音频那一型） ----
+   *
+   * 用户第二次报的：「第二段视频依旧没有声音」—— 他那个站（YouTube 4K）的音频是
+   * **WebM/Opus**，走的是"拆包 + Opus→AAC 转码"那条路，和 fMP4 完全是两条：
+   * 切段清空缓冲后，**WebM 的头部（Tracks）也一起没了**，只剩裸 Cluster；
+   * 而那条路原来**根本没有"借头部"的地方**（fMP4 那条有 seenInit，WebM 这条没有），
+   * 于是整个音频组被静默丢掉 —— 第一段自带头部所以有声音，只有第二段出事。
+   *
+   * 怎么验：视频用 fMP4 分片、音频用真正的 WebM/Opus（从夹具拆出头部 + 裸 Cluster）。
+   * ① 头部 + Cluster 都送 → 超过阈值 → 自动切段；
+   * ② 第二段**只送裸 Cluster、不送头部** → 能不能借到头部、音轨还在不在，就看这一步。
+   */
+  let webmCut = null;
+  let webmCutTarget = null;
+  try {
+    // 夹具里就有现成的"头部 + 裸 Cluster"（`make-fixtures` 按 MSE 的形态切好的）
+    const webmHeaderB64 = readFileSync(
+      join(ROOT, 'test', 'fixtures', 'webm-vp9', 'audio-init.webm'),
+    ).toString('base64');
+    const webmMediaB64 = readFileSync(
+      join(ROOT, 'test', 'fixtures', 'webm-vp9', 'audio-clusters.webm'),
+    ).toString('base64');
+
+    await evalIn(cdp, control.sessionId, `(async () => {
+      const got = await chrome.storage.local.get('vh:settings');
+      await chrome.storage.local.set({ 'vh:settings': { ...(got['vh:settings'] || {}),
+        autoCutCapture: true, autoCutMb: 0.5,
+        autoExportCapture: false, autoSnapshotCapture: false } });
+      return 'ok';
+    })()`);
+
+    const pageUrl = `${origin}/__page/mse`;
+    const created = await cdp.send('Target.createTarget', { url: pageUrl });
+    webmCutTarget = created.result?.targetId;
+    await sleep(1800);
+    const tabId = await evalIn(cdp, control.sessionId, `(async () => {
+      const tabs = await chrome.tabs.query({ url: ${JSON.stringify(pageUrl)} });
+      return tabs.length ? tabs[0].id : null;
+    })()`);
+    if (!Number.isInteger(tabId)) throw new Error('找不到 MSE 测试页的标签页');
+
+    webmCut = JSON.parse(await evalIn(cdp, control.sessionId, `(async () => {
+      const toB64 = (u8) => {
+        let s = '';
+        const CH = 0x8000;
+        for (let i = 0; i < u8.length; i += CH) s += String.fromCharCode.apply(null, u8.subarray(i, i + CH));
+        return btoa(s);
+      };
+      const load = async (p) => new Uint8Array(await (await fetch(${JSON.stringify(origin)} + p)).arrayBuffer());
+      const b64ToBytes = (b64) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      const vInit = await load('/dash-split/init-stream0.m4s');
+      const vFrag1 = await load('/dash-split/chunk-stream0-00001.m4s');
+      const vFrag2 = await load('/dash-split/chunk-stream0-00002.m4s');
+      const vFrag3 = await load('/dash-split/chunk-stream0-00003.m4s');
+      const webmHeader = b64ToBytes(${JSON.stringify(webmHeaderB64)});
+      const webmMedia = b64ToBytes(${JSON.stringify(webmMediaB64)});
+      const V = 'video/mp4; codecs="avc1.64001e"';
+      const A = 'audio/webm; codecs="opus"';
+      const send = (seq, mime, bytes) => chrome.runtime.sendMessage({
+        type: 'vh:mse-buffer', seq, mime, base64: toB64(bytes),
+      });
+      const state = async () => (await chrome.runtime.sendMessage({ type: 'vh:record-state' }))?.state || {};
+
+      const started = await chrome.runtime.sendMessage({ type: 'vh:mse-start', tabId: ${tabId} });
+      if (!started.ok) return JSON.stringify({ ok: false, error: started.error });
+
+      // ① 第一段：视频 init + 三片、音频**头部 + 裸 Cluster** —— 约 580 KB，超过 0.5 MB 阈值
+      let seq = 0;
+      await send(seq++, V, vInit);
+      await send(seq++, A, webmHeader);
+      await send(seq++, V, vFrag1);
+      await send(seq++, A, webmMedia);
+      await send(seq++, V, vFrag2);
+      await send(seq++, V, vFrag3);
+
+      let notice = null;
+      let name = null;
+      for (let i = 0; i < 20 && !name; i += 1) {
+        await new Promise((r) => setTimeout(r, 400));
+        const st = await state();
+        if (st.captureNotice && /先存下一段完整文件/.test(st.captureNotice)) {
+          notice = st.captureNotice;
+          const m = String(notice).match(/（(vh-mse-[^）]+)）/);
+          if (m) name = m[1];
+        }
+      }
+
+      // ② 第二段：**只送裸 Cluster（没有 WebM 头部）**+ 一片视频 —— 约 244 KB，不超阈值，
+      //    所以它会留在缓冲里，直到收尾
+      await send(seq++, V, vFrag1);
+      await send(seq++, A, webmMedia);
+      await new Promise((r) => setTimeout(r, 800));
+
+      const stopped = await chrome.runtime.sendMessage({ type: 'vh:mse-stop' });
+      let finalB64 = null;
+      if (stopped?.fileName) {
+        try {
+          const root = await navigator.storage.getDirectory();
+          const fh = await root.getFileHandle(stopped.fileName);
+          const bytes = new Uint8Array(await (await fh.getFile()).arrayBuffer());
+          finalB64 = toB64(bytes);
+        } catch { /* 读不出来就算了，断言那边会报 */ }
+      }
+      return JSON.stringify({
+        notice, name,
+        stoppedOk: stopped?.ok === true,
+        stoppedError: stopped?.error || null,
+        stoppedName: stopped?.fileName || null,
+        stoppedWarnings: stopped?.warnings || [],
+        finalB64,
+      });
+    })()`, { timeout: 180000 }));
+  } catch (err) {
+    console.error(`  ✗ WebM/Opus 音频的切段用例失败：${err.message}`);
+    problems += 1;
+  } finally {
+    await evalIn(cdp, control.sessionId, `(async () => {
+      const root = await navigator.storage.getDirectory();
+      const names = [];
+      for await (const [name] of root.entries()) names.push(name);
+      const mine = names.filter((n) => /视频|MSE/.test(n));
+      for (const n of mine) { try { await root.removeEntry(n); } catch { /* 已经不在了 */ } }
+      const key = 'vh:media-index';
+      const index = (await chrome.storage.local.get(key))[key] || {};
+      for (const n of mine) delete index[n];
+      await chrome.storage.local.set({ [key]: index });
+      const got = await chrome.storage.local.get('vh:settings');
+      await chrome.storage.local.set({ 'vh:settings': { ...(got['vh:settings'] || {}),
+        autoCutMb: 600, autoSnapshotCapture: true, autoExportCapture: true } });
+      return 'ok';
+    })()`).catch(() => {});
+    if (webmCutTarget) await cdp.send('Target.closeTarget', { targetId: webmCutTarget }).catch(() => {});
+  }
+
+  if (webmCut && webmCut.ok !== false) {
+    console.log(`  · WebM/Opus 那一型：切段提示=「${String(webmCut.notice || '（没等到切段）').slice(0, 40)}」｜`
+      + `第二段收尾=${webmCut.stoppedOk ? '成功' : `失败（${webmCut.stoppedError}）`}`);
+    if (!webmCut.stoppedOk) {
+      problems += 1;
+    } else if (webmCut.finalB64) {
+      mkdirSync(join(ROOT, '.tmp'), { recursive: true });
+      const file = join(ROOT, '.tmp', 'browser-autocut-webm.mp4');
+      writeFileSync(file, Buffer.from(webmCut.finalB64, 'base64'));
+      try {
+        const info = probe(file);
+        const v = (info.streams || []).find((s) => s.codec_type === 'video');
+        const a = (info.streams || []).find((s) => s.codec_type === 'audio');
+        console.log(`  · 切段之后那一段（WebM/Opus 音频）：`
+          + `${v ? `${v.codec_name} ${v.width}x${v.height}` : '**没有视频轨**'}｜`
+          + `${a ? `${a.codec_name} ${a.sample_rate}Hz` : '**没有音频轨**'}｜`
+          + `${Number(info.format.duration).toFixed(2)} 秒`);
+        if (!a) {
+          console.error('  ✗ WebM/Opus 音频那一型：切段之后那一段**没有声音** —— '
+            + '头部丢了、又没有借回来的地方，整个音频组被丢掉');
+          if (webmCut.stoppedWarnings?.length) {
+            console.error(`    收尾回执里的提示：${webmCut.stoppedWarnings.join('；').slice(0, 240)}`);
+          }
+          problems += 1;
+        } else {
+          console.log('  ✓ WebM/Opus 音频那一型：切段之后那一段照样有声音');
+        }
+      } catch (err) {
+        console.error(`  ✗ WebM/Opus 那一型的产物 ffprobe 失败：${err.message}`);
+        problems += 1;
+      }
+    }
+  }
+
   /* ---- 8c. 抓流 + WebM/Opus 音频：产物里必须有声音 ----
    *
    * 用户报的：「抓 YouTube 的视频可以抓到画面，但是抓不到声音。」
