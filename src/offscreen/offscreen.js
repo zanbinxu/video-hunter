@@ -840,6 +840,36 @@ function assembleMseCapture(s) {
   // 借初始化段时出的岔子（借错了 / 没得借）—— 这些以前是**静默**的，
   // 用户只看到"这一段没声音"。攒起来一起写进产物提示里。
   const reuseNotes = [];
+
+  /**
+   * 这一组属于哪个大类（video / audio），给"头部或初始化段丢了"的那两条路（fMP4 与 WebM）共用。
+   *
+   * 判据的优先级：
+   *   1. **这条流自己的记录**（按分组键 mime / sb:编号）—— 最准，但**键会变**：
+   *      播放器换清晰度时会重建 SourceBuffer，编号就换了（用户实报的那次正是这样：
+   *      切段之后音频借到了头部、**画面没有**，产物只剩声音）；
+   *   2. mime 推出来的；
+   *   3. **排除法**：这次组装里"哪个大类还没有着落"，这一组就是它 —— 键变了但两条轨
+   *      的不同时变时，这一条就能把画面/声音分开（WebM 的轨道号帮不上忙：
+   *      实测两条独立轨**都写 track 1**）。
+   */
+  const claimedTypes = new Set();
+  for (const a of analyzed) {
+    const t = s.seenStreamType.get(streamKeyOf(a));
+    if (t) claimedTypes.add(t);
+  }
+  const rescuableTypes = new Set();
+  for (const [k, t] of s.seenStreamType) {
+    if (s.seenWebmHeader.has(k) || s.seenInit.has(t)) rescuableTypes.add(t);
+  }
+  const resolveGroupType = (a) => {
+    const own = s.seenStreamType.get(streamKeyOf(a));
+    if (own) return own;
+    if (a.contentType) return a.contentType;
+    const missing = [...rescuableTypes].filter((t) => !claimedTypes.has(t));
+    return missing.length === 1 ? missing[0] : '';
+  };
+
   for (const a of analyzed) {
     if (a.container === 'mpegts') {
       // HLS 的 TS 分片：要用 mux.js 重封装成 fMP4 才能跟另一条轨合并
@@ -869,14 +899,15 @@ function assembleMseCapture(s) {
       // 第一段自带头部所以有声音，第二段只剩裸 Cluster —— 而 WebM 这条路原来**根本没有
       // 借头部的地方**（fMP4 那条有 seenInit，WebM 这条没有），于是整组被静默丢掉。
       const key = streamKeyOf(a);
-      const own = s.seenStreamType.get(key) || a.contentType || '';
+      const own = resolveGroupType(a);
       let header = s.seenWebmHeader.get(key) || null;
       if (!header && own) {
-        // 退一步：按大类找（键可能因为播放器重建了 SourceBuffer 而变过）
+        // 键对不上（播放器重建过 SourceBuffer）或本来就没记录 —— 按大类找
         for (const [k, h] of s.seenWebmHeader) {
           if (s.seenStreamType.get(k) === own) { header = h; break; }
         }
       }
+      if (header) claimedTypes.add(own || 'audio');
       if (header) {
         // 借到了就交给下面 WebM 那条路（拆包 + Opus→AAC 转码）—— 它要求 init 和 fragments 都在
         webmGroups.push({ ...a, init: header, fragments: a.raw, reusedInit: true });
@@ -907,9 +938,10 @@ function assembleMseCapture(s) {
       // init 所以一切正常，切段后全靠借，于是音频借错了。判据只能是分片自己的
       // `tfhd.track_ID`（见 pickReusableInit）。
       const want = readFragmentMediaTime(a.raw)?.trackId ?? null;
-      // ① 先问"这条流自己先前是什么"（分组键稳定，最准）；
-      // ② 没有记录时才用 trackId / 大类去猜（见 pickReusableInit）。
-      const own = s.seenStreamType.get(streamKeyOf(a)) || '';
+      // ① 先问"这条流自己先前是什么"（分组键稳定时最准）；
+      // ② 键变了就用排除法（见 resolveGroupType）；
+      // ③ 最后才用 trackId / 大类去猜（见 pickReusableInit）。
+      const own = resolveGroupType(a);
       const picked = pickReusableInit(initCandidates, {
         contentType: own || a.contentType,
         trackId: want,

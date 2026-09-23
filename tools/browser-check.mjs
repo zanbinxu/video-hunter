@@ -4192,6 +4192,170 @@ async function runExtensionExtras(cdp, extId, origin) {
     }
   }
 
+  /* ---- 8b-6. 两条轨**都是 WebM** 时（YouTube VP9 画面 + Opus 声音），
+   *            切段之后两条轨都必须还在 ----
+   *
+   * 用户第三次报的（他 22:32/22:33 那两份真实产物）：
+   *   …-223242.webm   49.9 MB / 30 秒   vp9 3840x2160 + opus 48kHz 2ch   ← 第一段：两条轨都在 ✓
+   *   …-223355-2.mp4   12.5 MB / 540 秒  **只有 aac，没有画面**            ← 第二段：画面没了 ✗
+   *
+   * 也就是说：切段之后**画面**那一组没能借回 WebM 头部（音频借到了），于是产物变成"只有声音"。
+   * 和 8b-5 一样是"头部丢了"，只是这次丢的是画面那条 —— 两条都要验。
+   */
+  let webmBoth = null;
+  let webmBothTarget = null;
+  try {
+    const rd = (p) => readFileSync(join(ROOT, 'test', 'fixtures', 'webm-vp9', p)).toString('base64');
+    const vInitB64 = rd('video-init.webm');
+    const vClustersB64 = rd('video-clusters.webm');
+    const aInitB64 = rd('audio-init.webm');
+    const aClustersB64 = rd('audio-clusters.webm');
+
+    await evalIn(cdp, control.sessionId, `(async () => {
+      const got = await chrome.storage.local.get('vh:settings');
+      await chrome.storage.local.set({ 'vh:settings': { ...(got['vh:settings'] || {}),
+        autoCutCapture: true, autoCutMb: 0.35,
+        autoExportCapture: false, autoSnapshotCapture: false } });
+      return 'ok';
+    })()`);
+
+    const pageUrl = `${origin}/__page/mse`;
+    const created = await cdp.send('Target.createTarget', { url: pageUrl });
+    webmBothTarget = created.result?.targetId;
+    await sleep(1800);
+    const tabId = await evalIn(cdp, control.sessionId, `(async () => {
+      const tabs = await chrome.tabs.query({ url: ${JSON.stringify(pageUrl)} });
+      return tabs.length ? tabs[0].id : null;
+    })()`);
+    if (!Number.isInteger(tabId)) throw new Error('找不到 MSE 测试页的标签页');
+
+    webmBoth = JSON.parse(await evalIn(cdp, control.sessionId, `(async () => {
+      const toB64 = (u8) => {
+        let s = '';
+        const CH = 0x8000;
+        for (let i = 0; i < u8.length; i += CH) s += String.fromCharCode.apply(null, u8.subarray(i, i + CH));
+        return btoa(s);
+      };
+      const b64ToBytes = (b64) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      const vInit = b64ToBytes(${JSON.stringify(vInitB64)});
+      const vClusters = b64ToBytes(${JSON.stringify(vClustersB64)});
+      const aInit = b64ToBytes(${JSON.stringify(aInitB64)});
+      const aClusters = b64ToBytes(${JSON.stringify(aClustersB64)});
+      // ⚠️ 全部**不带 mime、只有 sbId**（真实站点实测就是这样：那条 SourceBuffer 的
+      //    addSourceBuffer 没经过补丁）—— 这样"这条流的身份"就是 sbId。
+      const send = (seq, sbId, bytes) => chrome.runtime.sendMessage({
+        type: 'vh:mse-buffer', seq, mime: '', sbId, base64: toB64(bytes),
+      });
+      const state = async () => (await chrome.runtime.sendMessage({ type: 'vh:record-state' }))?.state || {};
+
+      const started = await chrome.runtime.sendMessage({ type: 'vh:mse-start', tabId: ${tabId} });
+      if (!started.ok) return JSON.stringify({ ok: false, error: started.error });
+
+      // ① 第一段：两条轨的头部 + Cluster 都送（再各补一遍 Cluster 把体积顶上阈值 ——
+      //    重复的字节在组装时会被指纹判重，所以第一段的内容还是干净的）
+      let seq = 0;
+      await send(seq++, 'v1', vInit);
+      await send(seq++, 'a1', aInit);
+      await send(seq++, 'v1', vClusters);
+      await send(seq++, 'a1', aClusters);
+      await send(seq++, 'v1', vClusters);
+      await send(seq++, 'a1', aClusters);
+
+      let notice = null;
+      let name = null;
+      for (let i = 0; i < 20 && !name; i += 1) {
+        await new Promise((r) => setTimeout(r, 400));
+        const st = await state();
+        if (st.captureNotice && /先存下一段完整文件/.test(st.captureNotice)) {
+          notice = st.captureNotice;
+          const m = String(notice).match(/（(vh-mse-[^）]+)）/);
+          if (m) name = m[1];
+        }
+      }
+
+      // ② 第二段：只送 Cluster、两条轨都不送头部；**画面那条换了一个 sbId**
+      //    （播放器换清晰度时重建 SourceBuffer —— 用户实报的那次就是这样：
+      //     音频借到了头部、画面没有，产物只剩声音）
+      await send(seq++, 'v2', vClusters);
+      await send(seq++, 'a1', aClusters);
+      await new Promise((r) => setTimeout(r, 800));
+
+      const stopped = await chrome.runtime.sendMessage({ type: 'vh:mse-stop' });
+      let finalB64 = null;
+      if (stopped?.fileName) {
+        try {
+          const root = await navigator.storage.getDirectory();
+          const fh = await root.getFileHandle(stopped.fileName);
+          const bytes = new Uint8Array(await (await fh.getFile()).arrayBuffer());
+          finalB64 = toB64(bytes);
+        } catch { /* 读不出来就算了 */ }
+      }
+      return JSON.stringify({
+        notice, name,
+        stoppedOk: stopped?.ok === true,
+        stoppedError: stopped?.error || null,
+        stoppedName: stopped?.fileName || null,
+        stoppedWarnings: stopped?.warnings || [],
+        finalB64,
+      });
+    })()`, { timeout: 180000 }));
+  } catch (err) {
+    console.error(`  ✗ 两条轨都是 WebM 的切段用例失败：${err.message}`);
+    problems += 1;
+  } finally {
+    await evalIn(cdp, control.sessionId, `(async () => {
+      const root = await navigator.storage.getDirectory();
+      const names = [];
+      for await (const [name] of root.entries()) names.push(name);
+      const mine = names.filter((n) => /视频|MSE/.test(n));
+      for (const n of mine) { try { await root.removeEntry(n); } catch { /* 已经不在了 */ } }
+      const key = 'vh:media-index';
+      const index = (await chrome.storage.local.get(key))[key] || {};
+      for (const n of mine) delete index[n];
+      await chrome.storage.local.set({ [key]: index });
+      const got = await chrome.storage.local.get('vh:settings');
+      await chrome.storage.local.set({ 'vh:settings': { ...(got['vh:settings'] || {}),
+        autoCutMb: 600, autoSnapshotCapture: true, autoExportCapture: true } });
+      return 'ok';
+    })()`).catch(() => {});
+    if (webmBothTarget) await cdp.send('Target.closeTarget', { targetId: webmBothTarget }).catch(() => {});
+  }
+
+  if (webmBoth && webmBoth.ok !== false) {
+    console.log(`  · WebM 两条轨那一型：切段提示=「${String(webmBoth.notice || '（没等到切段）').slice(0, 36)}」｜`
+      + `第二段收尾=${webmBoth.stoppedOk ? '成功' : `失败（${webmBoth.stoppedError}）`}`);
+    if (!webmBoth.stoppedOk) {
+      problems += 1;
+    } else if (webmBoth.finalB64) {
+      mkdirSync(join(ROOT, '.tmp'), { recursive: true });
+      const file = join(ROOT, '.tmp', webmBoth.stoppedName?.endsWith('.webm') ? 'browser-autocut-both.webm' : 'browser-autocut-both.mp4');
+      writeFileSync(file, Buffer.from(webmBoth.finalB64, 'base64'));
+      try {
+        const info = probe(file);
+        const v = (info.streams || []).find((s) => s.codec_type === 'video');
+        const a = (info.streams || []).find((s) => s.codec_type === 'audio');
+        console.log(`  · 切段之后那一段（两条轨都是 WebM，${webmBoth.stoppedName}）：`
+          + `${v ? `${v.codec_name} ${v.width}x${v.height}` : '**没有视频轨**'}｜`
+          + `${a ? `${a.codec_name} ${a.sample_rate}Hz` : '**没有音频轨**'}｜`
+          + `${Number(info.format.duration).toFixed(2)} 秒`);
+        if (!v || !a) {
+          console.error(`  ✗ WebM 两条轨那一型：切段之后那一段缺轨（`
+            + `${v ? '' : '画面'}${!v && !a ? '和' : ''}${a ? '' : '声音'}没了）`
+            + ' —— 头部丢了之后没借回来');
+          if (webmBoth.stoppedWarnings?.length) {
+            console.error(`    收尾回执里的提示：${webmBoth.stoppedWarnings.join('；').slice(0, 240)}`);
+          }
+          problems += 1;
+        } else {
+          console.log('  ✓ WebM 两条轨那一型：切段之后画面和声音都在');
+        }
+      } catch (err) {
+        console.error(`  ✗ WebM 两条轨那一型的产物 ffprobe 失败：${err.message}`);
+        problems += 1;
+      }
+    }
+  }
+
   /* ---- 8c. 抓流 + WebM/Opus 音频：产物里必须有声音 ----
    *
    * 用户报的：「抓 YouTube 的视频可以抓到画面，但是抓不到声音。」
