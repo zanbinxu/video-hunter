@@ -194,6 +194,54 @@ export function listInitTracks(input) {
   return types;
 }
 
+/**
+ * 列出一个初始化段（moov）里每条轨的 **track_ID** 和类型。
+ *
+ * 为什么需要它（不是锦上添花）：抓流中途会丢掉初始化段 —— 自动切段会把缓冲清空，
+ * 而播放器**不会重发 moov**，所以后面那些"只有分片"的组只能借先前收到的那一份 init。
+ * 而**分片自己的 `tfhd.track_ID` 是唯一不会认错的依据**：
+ *
+ *   · mime 可能压根没有（真实站点实测：那条 SourceBuffer 的 `addSourceBuffer`
+ *     没经过补丁，于是每次 append 都报空 mime）；
+ *   · 大类（video/audio）也可能是猜的。
+ *
+ * 借错了会怎样：合并时按 trackId 挑样本，借来的 init 里没有这个 id → 这一组整条轨
+ * 被丢掉。用户报的「600 MB 自动切段之后那一段没有声音」就是这么来的：
+ * 切段前每组自带 init 所以正常，切段后全靠借，音频借到了视频的 init。
+ *
+ * @returns {Array<{id:number, handler:string}>} 认不出来就返回空数组
+ */
+export function listInitTrackIds(input) {
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  const moov = findBoxPath(bytes, ['moov']);
+  if (!moov) return [];
+
+  const out = [];
+  for (const trak of childBoxes(bytes, moov[0]).filter((b) => b.type === 'trak')) {
+    const tkhd = childBoxes(bytes, trak).find((b) => b.type === 'tkhd');
+    if (!tkhd) continue;
+    // tkhd 的负载：version(1) + flags(3)，然后 v1 是 8+8 字节时间、v0 是 4+4，
+    // 紧接着才是 track_ID —— 版本不同偏移差 8 字节，照 v0 读会把 id 读成半个时间。
+    const version = bytes[tkhd.payloadStart];
+    const idAt = tkhd.payloadStart + 4 + (version === 1 ? 16 : 8);
+    const id = ((bytes[idAt] << 24) | (bytes[idAt + 1] << 16) | (bytes[idAt + 2] << 8) | bytes[idAt + 3]) >>> 0;
+
+    const mdia = childBoxes(bytes, trak).find((b) => b.type === 'mdia');
+    const hdlr = mdia ? childBoxes(bytes, mdia).find((b) => b.type === 'hdlr') : null;
+    const handler = hdlr
+      ? String.fromCharCode(
+        bytes[hdlr.payloadStart + 8], bytes[hdlr.payloadStart + 9],
+        bytes[hdlr.payloadStart + 10], bytes[hdlr.payloadStart + 11],
+      )
+      : '';
+    out.push({
+      id,
+      handler: handler === 'vide' ? 'video' : handler === 'soun' ? 'audio' : handler,
+    });
+  }
+  return out;
+}
+
 /* ------------------------------------------------------------------ *
  * 结构诊断
  *

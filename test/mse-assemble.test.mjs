@@ -11,8 +11,9 @@ import { readFileSync, readdirSync } from 'node:fs';
 
 import {
   groupBuffers, analyzeGroup, sniffContainer, contentTypeFromMime,
-  fingerprint, explainEmptyCapture, explainMissingInit,
+  fingerprint, explainEmptyCapture, explainMissingInit, pickReusableInit,
 } from '../src/parser/mse-assemble.js';
+import { listInitTrackIds } from '../src/parser/fmp4-file.js';
 import { mergeFmp4 } from '../src/parser/mp4-merge.js';
 import { fixturePath, probe, videoStream, audioStream, writeTmp, hasFfprobe } from './helpers.mjs';
 
@@ -298,4 +299,74 @@ test('模拟一次完整的 DASH 播放采集 → 合并 → 音视频都在', {
   assert.equal(a.codec_name, 'aac');
   const dur = Number(info.format.duration);
   assert.ok(Math.abs(dur - 12) < 0.7, `时长应约 12 秒，实际 ${dur.toFixed(3)}`);
+});
+
+/* ------------------------------------------------------------------ *
+ * 自动切段之后"借初始化段"必须借对
+ *
+ * 用户报的：抓流到 600 MB 自动切了一段、接着录下一段 —— **下一段没有声音**。
+ *
+ * 机制：切段会把缓冲清空，而播放器**不会重发 moov**，所以下一段的所有分片都没有
+ * 初始化段，只能借"本次会话里先前收到的那一份"。而借哪一份**不能按 mime 猜**：
+ * 真实站点上有一批 append 根本没有 mime（`mse-hook` 的注释里写着这是实测到的），
+ * 这时大类推不出来，旧代码会回退成"当视频用" —— 音频那组分片于是借到**视频**的
+ * init，合并时按 trackId 挑样本，音轨整条被丢掉。切段前每组自带 init，所以正常。
+ *
+ * 唯一不会认错的依据是**分片自己的 `tfhd.track_ID`**，也就是这两个用例钉的东西。
+ * ------------------------------------------------------------------ */
+
+test('初始化段里的 trackId 要读得出来，而且**会撞号**（这正是不能只靠它的原因）', () => {
+  const v = listInitTrackIds(readChunk('init-stream0.m4s'));
+  const a = listInitTrackIds(readChunk('init-stream1.m4s'));
+
+  assert.equal(v.length, 1, '视频 init 里应该只有一条轨');
+  assert.equal(v[0].handler, 'video');
+  assert.equal(a.length, 1, '音频 init 里应该只有一条轨');
+  assert.equal(a[0].handler, 'audio');
+  assert.ok(v[0].id > 0 && a[0].id > 0);
+
+  // ⚠️ 实测（就是这两份夹具）：两条独立轨**都写 track 1**。
+  // 所以"按 trackId 认 init"单独用是不够的 —— 调用方还要用"这条流先前是什么"
+  // （分组键 → 大类）来定，否则撞号时只能取第一条，音频照样借错。
+  assert.equal(v[0].id, a[0].id, '这两份夹具的 trackId 相同（换了夹具的话，这条断言会提醒你）');
+});
+
+test('借初始化段：trackId 优先、撞号时按大类定、都没有才回退（猜错就是整条音轨没了）', () => {
+  const vInit = readChunk('init-stream0.m4s');
+  const aInit = readChunk('init-stream1.m4s');
+  const vId = listInitTrackIds(vInit)[0].id;
+  const aId = listInitTrackIds(aInit)[0].id;
+  const candidates = [
+    { key: 'video', contentType: 'video', init: vInit, trackIds: [vId] },
+    { key: 'audio', contentType: 'audio', init: aInit, trackIds: [aId] },
+  ];
+
+  // ① 撞号 + 知道大类（真实站点那条路：分组键 → 先前的大类）→ 按大类定
+  const tie = pickReusableInit(candidates, { contentType: 'audio', trackId: aId });
+  assert.equal(tie.by, 'trackId+type');
+  assert.equal(tie.candidate.contentType, 'audio', '音频分片必须借到音频的初始化段');
+
+  // ② 这就是那个 bug 的形状：既没有 mime、又没有"先前的大类"，只能回退成"当视频用"。
+  //    用例把"回退会借错"记下来 —— 所以调用方那条"按分组键记大类"的线索不可省。
+  const fallback = pickReusableInit(candidates, { contentType: '', trackId: null });
+  assert.equal(fallback.by, 'fallback');
+  assert.equal(fallback.candidate.contentType, 'video');
+
+  // ③ 有 mime 时按大类取（老行为不能丢）
+  const byType = pickReusableInit(candidates, { contentType: 'audio', trackId: null });
+  assert.equal(byType.by, 'type');
+  assert.equal(byType.candidate.contentType, 'audio');
+
+  // ④ 两份 init 的 trackId 不同时（别的打包器就是这样），trackId 直接定案
+  const distinct = [
+    { key: 'video', contentType: 'video', init: vInit, trackIds: [1] },
+    { key: 'audio', contentType: 'audio', init: aInit, trackIds: [2] },
+  ];
+  const byId = pickReusableInit(distinct, { contentType: '', trackId: 2 });
+  assert.equal(byId.by, 'trackId');
+  assert.equal(byId.candidate.contentType, 'audio');
+
+  // ⑤ 一份都借不到 → null（调用方要据此把"这一组没进产物"说出来，而不是静默丢掉）
+  assert.equal(pickReusableInit([], { contentType: 'audio', trackId: aId }), null);
+  assert.equal(pickReusableInit(null, { contentType: 'audio', trackId: aId }), null);
 });

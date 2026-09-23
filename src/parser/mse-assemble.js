@@ -183,6 +183,49 @@ export function groupBuffers(items) {
 }
 
 /**
+ * 给"只有分片、没有初始化段"的那一组挑一个能用的初始化段。
+ *
+ * 判据的优先级：
+ *
+ *   1. **分片自己的 `tfhd.track_ID` 能在哪份 init 里找到**；
+ *      ⚠️ 但 trackId 会撞号 —— 实测 ffmpeg 产的两条独立轨（视频一条、音频一条）
+ *      **都写 track 1**。撞号时如果调用方知道大类（`contentType`），就按大类定；
+ *   2. 按大类（video/audio）取；
+ *   3. 最后才退回"当视频用"的老行为 —— 保证修完不会比原来更差。
+ *
+ * ⚠️ 调用方还有一条**比 trackId 更准**的线索，必须先用它：这条流（按分组键：
+ * mime 或 `sb:<编号>`）**先前**被分析成什么大类。分组键在整个会话里是稳定的，
+ * 而"只有分片"的这一组光看字节推不出大类（真实站点上一批 append 根本没有 mime）。
+ *
+ * 为什么值得单拎成一个纯函数：这里借错一次，就是**整条音轨消失**（合并时按 trackId
+ * 挑样本，借来的 init 里没有这个 id，那一组直接被丢掉），而且从界面上完全看不出来
+ * ——用户只会说"切段之后那一段没声音"。有名字、有用例，才好钉住。
+ *
+ * @param {Array<{key:string, contentType:string, trackIds:number[], init:Uint8Array}>} candidates
+ * @param {{contentType?:string, trackId?:number|null}} [want]
+ * @returns {{candidate:object, by:'trackId'|'trackId+type'|'type'|'fallback'}|null}
+ */
+export function pickReusableInit(candidates = [], { contentType = '', trackId = null } = {}) {
+  const list = Array.isArray(candidates) ? candidates.filter(Boolean) : [];
+  if (trackId != null) {
+    const hits = list.filter((c) => (c.trackIds || []).includes(trackId));
+    if (hits.length === 1) return { candidate: hits[0], by: 'trackId' };
+    // 撞号（两条轨都写 track 1）：有大类就按大类定，没有只能取第一条
+    if (hits.length > 1 && contentType) {
+      const typed = hits.find((c) => c.contentType === contentType);
+      if (typed) return { candidate: typed, by: 'trackId+type' };
+    }
+    if (hits.length) return { candidate: hits[0], by: 'trackId' };
+  }
+  if (contentType) {
+    const hit = list.find((c) => c.contentType === contentType);
+    if (hit) return { candidate: hit, by: 'type' };
+  }
+  const fallback = list.find((c) => c.contentType === 'video') || list[0];
+  return fallback ? { candidate: fallback, by: 'fallback' } : null;
+}
+
+/**
  * 分析一组分片：是什么容器、哪条轨、初始化段和媒体分片分别是什么。
  *
  * @returns {{container:string, contentType:string, init?:Uint8Array, fragments?:Uint8Array,

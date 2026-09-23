@@ -3791,7 +3791,7 @@ async function runExtensionExtras(cdp, extId, origin) {
     await evalIn(cdp, control.sessionId, `(async () => {
       const got = await chrome.storage.local.get('vh:settings');
       await chrome.storage.local.set({ 'vh:settings': { ...(got['vh:settings'] || {}),
-        autoCutCapture: true, autoCutMb: 0.05,
+        autoCutCapture: true, autoCutMb: 0.3,
         autoExportCapture: true, downloadSubdir: 'VideoHunterAutoTest',
         autoSnapshotCapture: false } });
       return 'ok';
@@ -3815,35 +3815,71 @@ async function runExtensionExtras(cdp, extId, origin) {
         return btoa(s);
       };
       const load = async (p) => new Uint8Array(await (await fetch(${JSON.stringify(origin)} + p)).arrayBuffer());
-      const init = await load('/dash-split/init-stream0.m4s');
-      const frags = [];
-      for (const n of ['00001', '00002', '00003', '00004', '00005', '00006']) {
-        frags.push(await load('/dash-split/chunk-stream0-' + n + '.m4s'));
+      // ⚠️ 这一轮**故意按真实站点的形态来喂**：mime 是空的，只有 sbId。
+      // （mse-hook 的注释里写着这是实测存在的 —— 那条 SourceBuffer 的
+      //  addSourceBuffer 没经过我们的补丁，于是每次 append 都报空 mime。）
+      // 空 mime 会走 groupBuffers 的「按 sbId 分组」那条路，也正是用户那个 bug 的
+      // 触发条件：分片那一组推不出大类，回退成 'video' 就会借错初始化段。
+      const SB_V = 'v';
+      const SB_A = 'a';
+      const vInit = await load('/dash-split/init-stream0.m4s');
+      const aInit = await load('/dash-split/init-stream1.m4s');
+      const vFrags = [];
+      const aFrags = [];
+      for (const n of ['00001', '00002', '00003', '00004']) {
+        vFrags.push(await load('/dash-split/chunk-stream0-' + n + '.m4s'));
+        aFrags.push(await load('/dash-split/chunk-stream1-' + n + '.m4s'));
       }
+      const send = (seq, sbId, bytes) => chrome.runtime.sendMessage({
+        type: 'vh:mse-buffer', seq, mime: '', sbId, base64: toB64(bytes),
+      });
+      const state = async () => (await chrome.runtime.sendMessage({ type: 'vh:record-state' }))?.state || {};
+
       const started = await chrome.runtime.sendMessage({ type: 'vh:mse-start', tabId: ${tabId} });
       if (!started.ok) return JSON.stringify({ ok: false, error: started.error });
-      await chrome.runtime.sendMessage({ type: 'vh:mse-buffer', seq: 0, mime: 'video/mp4; codecs="avc1.64001e"', base64: toB64(init) });
-      for (const [i, c] of frags.entries()) {
-        await chrome.runtime.sendMessage({ type: 'vh:mse-buffer', seq: i + 1, mime: 'video/mp4', base64: toB64(c) });
-      }
-      // 心跳每秒判一次体积 → 到阈值就切 → 导出是异步的（等下载器写完）。
-      // ⚠️ 状态里的 captureNotice 有**两条**：快到阈值时的预告（**没有文件名**）
-      // 和真正切段之后那条（带文件名）。第一版只看 captureNotice 又用"没出现过就
-      // 记下来"锁死，结果锁在预告上、名字永远是空 —— 所以这里按"这条是不是切段那条"挑，
-      // 并且**以导出提示里的文件名为准**（那才是下载器真的写出去的那一份）。
+
+      // ① 第一段：两条轨的 init 都先送（真实播放器就是这样），再各送两片 ——
+      //    阈值 0.3 MB，两片视频 + 两片音频约 370 KB 就超了，心跳一到自动切段。
+      //    ⚠️ 阈值不能压得太低（0.05 MB 试过）：那样**第二段也会立刻被切走**，
+      //    收尾时缓冲是空的，报到的是"没有捕获到任何数据"，反而验不到要看的东西。
+      let seq = 0;
+      await send(seq++, SB_V, vInit);
+      await send(seq++, SB_A, aInit);
+      await send(seq++, SB_V, vFrags[0]);
+      await send(seq++, SB_A, aFrags[0]);
+      await send(seq++, SB_V, vFrags[1]);
+      await send(seq++, SB_A, aFrags[1]);
+
+      // 状态里的 captureNotice 有**两条**：快到阈值时的预告（没有文件名）和真正
+      // 切段那条（带文件名）—— 所以按"是不是切段那条"挑，别锁在预告上。
       let notice = null;
-      let exportNotice = null;
       let name = null;
-      let exportName = null;
-      let download = null;
-      for (let i = 0; i < 30; i += 1) {
-        await new Promise((r) => setTimeout(r, 500));
-        const st = (await chrome.runtime.sendMessage({ type: 'vh:record-state' }))?.state || {};
+      for (let i = 0; i < 20 && !name; i += 1) {
+        await new Promise((r) => setTimeout(r, 400));
+        const st = await state();
         if (st.captureNotice && /先存下一段完整文件/.test(st.captureNotice)) {
           notice = st.captureNotice;
           const m = String(notice).match(/（(vh-mse-[^）]+)）/);
           if (m) name = m[1];
         }
+      }
+
+      // ② 第二段 —— 用户报的"切完继续录的那一段"：**只送分片、不再送 init**，
+      //    而且**故意只送一片视频 + 一片音频**（约 180 KB，低于 0.3 MB 的阈值），
+      //    这样它不会被第二次切走，收尾时能原样拿来验"有没有声音"。
+      //    真实播放器这时也不会重发 moov，所以这一段的初始化段只能靠"本次会话里
+      //    先前收到的那一份"。**这一段有没有声音，就是这个用例要抓的东西。**
+      await send(seq++, SB_V, vFrags[2]);
+      await send(seq++, SB_A, aFrags[2]);
+      await new Promise((r) => setTimeout(r, 800));
+
+      // ③ 切段那条路的导出：句柄是离屏文档推过来的，SW 必须接住并说出来
+      let exportNotice = null;
+      let exportName = null;
+      let download = null;
+      for (let i = 0; i < 20; i += 1) {
+        await new Promise((r) => setTimeout(r, 400));
+        const st = await state();
         if (st.exportNotice) {
           exportNotice = st.exportNotice;
           const m = String(exportNotice).match(/已导出到下载目录：(.+?)\s*$/);
@@ -3857,10 +3893,29 @@ async function runExtensionExtras(cdp, extId, origin) {
         }
         if (download && exportNotice) break;
       }
-      // 收尾：不然下一次点「抓流」会被告知"还在进行中"
+
+      // ④ 收尾 → 手上前这一段的产物就是"切段之后那一段"，读出来交给 Node 那边 ffprobe
       const stopped = await chrome.runtime.sendMessage({ type: 'vh:mse-stop' });
+      let finalB64 = null;
+      if (stopped?.fileName) {
+        try {
+          const root = await navigator.storage.getDirectory();
+          const fh = await root.getFileHandle(stopped.fileName);
+          const bytes = new Uint8Array(await (await fh.getFile()).arrayBuffer());
+          let bin = '';
+          const CH = 0x8000;
+          for (let i = 0; i < bytes.length; i += CH) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+          finalB64 = btoa(bin);
+        } catch { /* 读不出来就别读，断言那边会报出来 */ }
+      }
       return JSON.stringify({
-        notice, exportNotice, name, exportName, download, stoppedOk: stopped?.ok === true,
+        notice, exportNotice, name, exportName, download,
+        stoppedOk: stopped?.ok === true,
+        stoppedError: stopped?.error || null,
+        stoppedName: stopped?.fileName || null,
+        stoppedWarnings: stopped?.warnings || [],
+        stoppedDetail: stopped?.detail ?? null,
+        finalB64,
       });
     })()`, { timeout: 180000 }));
   } catch (err) {
@@ -3916,6 +3971,56 @@ async function runExtensionExtras(cdp, extId, origin) {
       problems += 1;
     } else {
       console.log('  ✓ 自动切段那条路：产物落到了下载目录，而且界面上说了"已导出"');
+    }
+
+    // ---- 切段之后的那一段必须有声音（用户报的） ----
+    //
+    // 用户的原话：「到达 600 兆之后它会切片、自动保存、然后开始下一段录制 ——
+    // 这个下一段录制它是没有声音的。」
+    //
+    // 机制很清楚：切段会把缓冲清空，而播放器**不会重发 moov**，所以下一段的所有
+    // 分片都没有初始化段，只能靠"本次会话里先前收到的那一份"（`seenInit`）复用。
+    // 复用不上 → 那一组直接被丢掉 → 产物只剩画面。以前这条用例只喂**视频轨**，
+    // 所以怎么跑都发现不了。
+    if (cutExport.stoppedOk && cutExport.finalB64) {
+      mkdirSync(join(ROOT, '.tmp'), { recursive: true });
+      const file = join(ROOT, '.tmp', 'browser-autocut-next.mp4');
+      writeFileSync(file, Buffer.from(cutExport.finalB64, 'base64'));
+      try {
+        const info = probe(file);
+        const v = (info.streams || []).find((s) => s.codec_type === 'video');
+        const a = (info.streams || []).find((s) => s.codec_type === 'audio');
+        console.log(`  · 切段之后那一段（${cutExport.stoppedName}）：`
+          + `${v ? `${v.codec_name} ${v.width}x${v.height}` : '**没有视频轨**'}｜`
+          + `${a ? `${a.codec_name} ${a.sample_rate}Hz` : '**没有音频轨**'}｜`
+          + `${Number(info.format.duration).toFixed(2)} 秒`);
+        if (!v) {
+          console.error('  ✗ 切段之后那一段连视频轨都没有');
+          problems += 1;
+        } else if (!a) {
+          console.error('  ✗ 切段之后的那一段**没有声音** —— 下一段只有分片、没有初始化段，'
+            + '复用没生效，那一组被丢掉了');
+          if (cutExport.stoppedWarnings?.length) {
+            console.error(`    收尾回执里的提示：${cutExport.stoppedWarnings.join('；').slice(0, 240)}`);
+          }
+          if (cutExport.stoppedDetail) {
+            console.error(`    收尾回执里的 detail：${JSON.stringify(cutExport.stoppedDetail).slice(0, 240)}`);
+          }
+          problems += 1;
+        } else {
+          console.log('  ✓ 切段之后那一段有画面也有声音（初始化段复用成功）');
+        }
+      } catch (err) {
+        console.error(`  ✗ 切段之后那一段 ffprobe 失败：${err.message}`);
+        problems += 1;
+      }
+    } else if (cutExport.ok !== false && !cutExport.stoppedOk) {
+      console.error(`  ✗ 切段之后收尾失败 —— 没法验"切段之后那一段有没有声音"：`
+        + `${cutExport.stoppedError || '（没有错误信息）'}`);
+      if (cutExport.stoppedWarnings?.length) {
+        console.error(`    回执里的提示：${cutExport.stoppedWarnings.join('；').slice(0, 240)}`);
+      }
+      problems += 1;
     }
   }
 

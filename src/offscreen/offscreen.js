@@ -31,13 +31,14 @@ import {
 } from '../core/capture-limits.js';
 import { createTsRemuxer } from '../parser/remuxer.js';
 import { mergeFmp4, parseInitSegment } from '../parser/mp4-merge.js';
-import { listInitTracks } from '../parser/fmp4-file.js';
+import { listInitTracks, listInitTrackIds } from '../parser/fmp4-file.js';
 import { demuxWebm } from '../parser/webm-demux.js';
 import { mergeWebm, webmDurationSeconds } from '../parser/webm-merge.js';
 import { transcodeOpusToAac } from './audio-transcode.js';
 import {
   groupBuffers, analyzeGroup, concatChunks, explainEmptyCapture, explainMissingInit,
   finalizeCaptureBytes, readFragmentMediaTime, sniffContainer, contentTypeFromMime,
+  pickReusableInit,
 } from '../parser/mse-assemble.js';
 
 /** 当前会话。同一时间只允许一个。 */
@@ -314,6 +315,9 @@ function mseStart(msg = {}) {
     // 用途见 assembleMseCapture 里的注释：播放器中途重建 SourceBuffer 时
     // 可能只补分片、不再补 init，而我们其实早就见过它了。
     seenInit: new Map(),
+    // 每条流（分组键 → video/audio）先前分析出来的大类：给"只有分片"的那一组
+    // 认领初始化段时用（见 assembleMseCapture 里的注释）
+    seenStreamType: new Map(),
     statsTimer: null,
   };
   // 每秒报一次进度。抓流是"边播边收"，用户需要看到它确实在动 ——
@@ -784,6 +788,16 @@ function mediaSpanSeconds(s) {
  * 产物里会留下一个真空洞，比不暂停糟得多。所以想中途留一份，
  * 正确做法是"把手上这段先写出去，然后继续抓"，而不是"停一会儿"。
  */
+/**
+ * 一条流的"身份键" —— 必须和 `groupBuffers` 里的分组键**一字不差**
+ * （有 mime 用 mime，没有就用 `sb:<编号>`）。做成一模一样是有意的：分组键在整个
+ * 会话里稳定，所以"这条流先前是视频还是音频"可以按它记下来、以后按它查回来 ——
+ * 这是给"只有分片、没有初始化段"的那一组认领 init 时最准的线索。
+ */
+function streamKeyOf(a) {
+  return a.mime || `sb:${a.sbId || '未知'}`;
+}
+
 function assembleMseCapture(s) {
   const { groups, duplicates } = groupBuffers(s.items);
   // 把 mime 一起带进分析结果：分组是按 mime 分的，后面报错、报诊断都要用它，
@@ -793,11 +807,30 @@ function assembleMseCapture(s) {
   // 记住这次会话里见过的初始化段（按大类），后面要用。
   for (const a of analyzed) {
     if (a.init) s.seenInit.set(a.contentType || 'video', a.init);
+    // 这条流（按分组键：mime 或 sb:编号）**先前**被分析成什么大类 —— 这是给
+    // "只有分片、没有初始化段"的那一组认领 init 时**最准**的线索：分组键在整个
+    // 会话里是稳定的（同一个 SourceBuffer 的编号不会变），而真实站点上一批 append
+    // 根本没有 mime，光看分片字节推不出大类。trackId 也靠不住：实测 ffmpeg 产的
+    // 两条独立轨**都写 track 1**，撞号。
+    if (a.init && a.contentType) s.seenStreamType.set(streamKeyOf(a), a.contentType);
   }
+  // 借初始化段的候选项 —— **每条轨的 trackId 都要带上**：自动切段会把缓冲清空，
+  // 而播放器不会重发 moov，后面那些"只有分片"的组只能借先前收到的那一份 init。
+  // 借哪一份**不能按 mime 猜**（真实站点上有一批 append 根本没有 mime），
+  // 只能按分片自己的 tfhd.track_ID 认（见 pickReusableInit 的注释）。
+  const initCandidates = [...s.seenInit.entries()].map(([key, init]) => ({
+    key,
+    contentType: key,
+    init,
+    trackIds: listInitTrackIds(init).map((t) => t.id),
+  }));
 
   const tracks = [];
   const webmGroups = [];
   const reusedInit = [];
+  // 借初始化段时出的岔子（借错了 / 没得借）—— 这些以前是**静默**的，
+  // 用户只看到"这一段没声音"。攒起来一起写进产物提示里。
+  const reuseNotes = [];
   for (const a of analyzed) {
     if (a.container === 'mpegts') {
       // HLS 的 TS 分片：要用 mux.js 重封装成 fMP4 才能跟另一条轨合并
@@ -830,23 +863,44 @@ function assembleMseCapture(s) {
     } else if (a.missingInit && a.raw) {
       // 「只有分片、没有初始化段」——**但这次会话里早就见过一个**。
       //
-      // 真实场景：播放器中途重建了 SourceBuffer（seek、清缓冲、换清晰度），
-      // 重建之后可能只补分片、不再补 init。这时如果把整段抓流判死，
-      // 用户丢掉的是已经收了几十 MB 的东西（实测 200 段 / 21.4 MB，
+      // 真实场景：播放器中途重建了 SourceBuffer（seek、清缓冲、换清晰度）、
+      // 或者**自动切段把缓冲清空了**（切段之后播放器不会重发 moov）。这时如果把
+      // 整段抓流判死，用户丢掉的是已经收了几十 MB 的东西（实测 200 段 / 21.4 MB，
       // 而失败原因只是"开头不是 moov"）。
       //
-      // 复用是安全的：合并器会按 init 里的 trackId 去挑样本，
-      // 对不上会明确报「分片的 trackId 和 init 段对不上」，不会产出坏文件。
-      const remembered = s.seenInit.get(a.contentType || 'video');
-      if (remembered) {
-        reusedInit.push(a.contentType || 'video');
+      // ⚠️ 借哪一份 init **不能按 mime 猜**：真实站点上有一批 append 根本没有 mime，
+      // 这时大类推不出来，回退成「当视频用」就会让**音频那组分片借到视频的 init** ——
+      // 合并时按 trackId 挑样本，借来的 init 里没有那个 id，**整条音轨被丢掉**。
+      // 用户报的「600 MB 自动切段之后那一段没有声音」就是这么来的：切段前每组自带
+      // init 所以一切正常，切段后全靠借，于是音频借错了。判据只能是分片自己的
+      // `tfhd.track_ID`（见 pickReusableInit）。
+      const want = readFragmentMediaTime(a.raw)?.trackId ?? null;
+      // ① 先问"这条流自己先前是什么"（分组键稳定，最准）；
+      // ② 没有记录时才用 trackId / 大类去猜（见 pickReusableInit）。
+      const own = s.seenStreamType.get(streamKeyOf(a)) || '';
+      const picked = pickReusableInit(initCandidates, {
+        contentType: own || a.contentType,
+        trackId: want,
+      });
+      if (picked) {
+        const pickedType = picked.candidate.contentType || 'video';
+        reusedInit.push(pickedType);
         tracks.push({
-          init: remembered,
+          init: picked.candidate.init,
           fragments: a.raw,
-          handlers: listInitTracks(remembered),
+          handlers: listInitTracks(picked.candidate.init),
           container: 'fmp4',
           reusedInit: true,
         });
+        // 借来的 init 里如果没有这个 trackId，合并时这一组会被整条丢掉 ——
+        // 以前这件事**完全静默**（用户只看到"这一段没声音"）。现在写进产物提示里。
+        if (want != null && !(picked.candidate.trackIds || []).includes(want)) {
+          reuseNotes.push(`有一组分片（trackId=${want}）在本次会话收到的初始化段里找不到对应的轨，`
+            + `那一条轨没有进产物（这一组 ${a.raw.byteLength} 字节）`);
+        }
+      } else {
+        reuseNotes.push(`有一组只有分片、没有初始化段，而本次会话里也没有可以借的 —— `
+          + `这一组 ${a.raw.byteLength} 字节没有进产物（解决办法：点抓流之后刷新页面从头来）`);
       }
     }
     // 认不出容器的组直接跳过；一条都认不出时下面会给出明确错误
@@ -873,7 +927,7 @@ function assembleMseCapture(s) {
     };
   }
 
-  return finishAssembly(s, { analyzed, tracks, webmGroups, video, audio, reusedInit, duplicates });
+  return finishAssembly(s, { analyzed, tracks, webmGroups, video, audio, reusedInit, reuseNotes, duplicates });
 }
 
 /**
@@ -882,7 +936,7 @@ function assembleMseCapture(s) {
  * 单独一段的原因：这一步是**异步**的（转码），而上面挑轨是纯同步的判断。
  */
 async function finishAssembly(s, ctx) {
-  const { analyzed, tracks, webmGroups, reusedInit, duplicates } = ctx;
+  const { analyzed, tracks, webmGroups, reusedInit, reuseNotes, duplicates } = ctx;
   let { video, audio } = ctx;
   const warnings = [];
   let transcoded = null;
@@ -916,6 +970,7 @@ async function finishAssembly(s, ctx) {
       webmVideoTracks,
       webmAudioTracks,
       reusedInit,
+      reuseNotes,
       duplicates,
       warnings,
     });
@@ -992,10 +1047,15 @@ async function finishAssembly(s, ctx) {
     ok: true,
     kind: 'mp4',
     merged,
-    warnings: reusedInit.length
-      ? [`这份抓流中途播放器重建过缓冲区（只补了分片），初始化段用的是本次抓流里先前收到的那一份`
-        + `（${reusedInit.join('、')}）`, ...warnings]
-      : warnings,
+    warnings: [
+      ...(reusedInit.length
+        ? [`这份抓流中途播放器重建过缓冲区、或者自动切过段（那些组只补了分片），`
+          + `初始化段用的是本次抓流里先前收到的那一份（${reusedInit.join('、')}）`]
+        : []),
+      // 借初始化段时出的岔子（借错了 / 没得借）—— 这类问题以前是完全静默的
+      ...reuseNotes,
+      ...warnings,
+    ],
     duplicates,
     detail: {
       chunks: s.items.length,
@@ -1350,7 +1410,7 @@ function mseDiscard() {
  * 只负责"组装"，不落盘 —— 落盘统一由调用方走 `saveBuilt`（MP4/WebM 同一套）。
  */
 function finishWebmCapture(s, ctx) {
-  const { analyzed, webmVideoTracks, webmAudioTracks, reusedInit, duplicates, warnings } = ctx;
+  const { analyzed, webmVideoTracks, webmAudioTracks, reusedInit, reuseNotes, duplicates, warnings } = ctx;
   const video = webmVideoTracks[0];
   if (webmVideoTracks.length > 1) {
     warnings.push(`抓到了 ${webmVideoTracks.length} 条 WebM 画面轨，只用了最先出现的那一条`);
@@ -1392,10 +1452,14 @@ function finishWebmCapture(s, ctx) {
     kind: 'webm',
     merged,
     seconds: webmDurationSeconds(audio ? [video, audio] : [video]),
-    warnings: reusedInit.length
-      ? [`这份抓流中途播放器重建过缓冲区（只补了分片），初始化段用的是本次抓流里先前收到的那一份`
-        + `（${reusedInit.join('、')}）`, ...warnings]
-      : warnings,
+    warnings: [
+      ...(reusedInit.length
+        ? [`这份抓流中途播放器重建过缓冲区、或者自动切过段（那些组只补了分片），`
+          + `初始化段用的是本次抓流里先前收到的那一份（${reusedInit.join('、')}）`]
+        : []),
+      ...reuseNotes,
+      ...warnings,
+    ],
     duplicates,
     detail: {
       chunks: s.items.length,
