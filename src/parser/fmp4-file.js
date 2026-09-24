@@ -40,9 +40,22 @@ export function listTopLevelBoxes(bytes) {
     // size 字段本身占 8 字节，所以最小合法值是 8
     let boxSize = size === 0 ? bytes.length - offset : size;
     if (boxSize < 8 || offset + boxSize > bytes.length) {
+      // ⚠️ 诊断（测试期加的）：光说"长度不合法"没法判断是"缺了一段"还是"错位了"。
+      // 把出错点前后的原始字节带出来 —— 用户实测两次都在偏移 701 处读到乱码类型，
+      // 有这几个字节就能判断：是盒子头被挪了几字节（错位），还是中间整块没了（丢段）。
+      const hex = (from, to) => {
+        const parts = [];
+        for (let i = Math.max(0, from); i < Math.min(bytes.length, to); i += 1) {
+          parts.push(bytes[i].toString(16).padStart(2, '0'));
+        }
+        return parts.join(' ');
+      };
       throw new Error(
         `第 ${out.length + 1} 个 box（${type}）声明的长度不合法：`
-        + `在偏移 ${offset} 处声称 ${boxSize} 字节，但文件只剩 ${bytes.length - offset} 字节`,
+        + `在偏移 ${offset} 处声称 ${boxSize} 字节，但文件只剩 ${bytes.length - offset} 字节；`
+        + `出错点前 16 字节 [${hex(offset - 16, offset)}]，`
+        + `出错点本身 [${hex(offset, offset + 16)}]，`
+        + `再往前 32 字节 [${hex(offset - 48, offset - 32)}]`,
       );
     }
     out.push({ type, start: offset, end: offset + boxSize });
