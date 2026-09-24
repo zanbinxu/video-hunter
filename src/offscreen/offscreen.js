@@ -1191,6 +1191,31 @@ async function finishAssembly(s, ctx) {
     },
   });
 
+  // ---- 安全网（测试期加的，发布前会去掉）：产物里到底有没有我们喂进去的那几条轨 ----
+  //
+  // 用户实测过最难受的一种失败：**喂进去 56 MB 画面，产物却是一条纯音轨的 MP4**，
+  // 而界面上写着"成功"。合并这一步不会为"某条轨一个样本都没进去"报错 ——
+  // 所以这里自己读一遍产物的 moov，缺了哪条就明确说出来，不再让它冒充成功。
+  try {
+    // ⚠️ listInitTracks 返回的是**字符串数组**（例如 ['video']），不是对象数组 ——
+    // 第一版按 t.handler 取，结果全是 null，健康的产物也被判成"少了画面"（自己踩的假报警）。
+    const outHandlers = listInitTracks(merged).map((h) => String(h || ''));
+    const wantVideo = Boolean(video);
+    const wantAudio = Boolean(audio || transcoded);
+    const missing = [];
+    if (wantVideo && !outHandlers.includes('video')) missing.push('画面');
+    if (wantAudio && !outHandlers.includes('audio')) missing.push('声音');
+    if (missing.length) {
+      const fed = `${wantVideo ? `画面 ${((video?.fragments?.byteLength || 0) / 1048576).toFixed(1)}MB` : '无画面'}`
+        + ` / ${wantAudio ? '声音' : '无声音'}`;
+      warnings.push(`⚠️ 产物里少了【${missing.join('和')}】那条轨：喂进去的是 ${fed}，`
+        + `产物里只有 ${outHandlers.join('、') || '（认不出）'} —— 这一份不完整，`
+        + '请把这张提示卡整段发给开发者');
+    }
+  } catch (err) {
+    warnings.push(`产物轨检查没跑成：${err?.message || err}`);
+  }
+
   return {
     ok: true,
     kind: 'mp4',
