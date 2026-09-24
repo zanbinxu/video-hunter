@@ -98,6 +98,7 @@
    */
   const pending = [];
   let inFlight = false;
+  let inFlightItem = null;
   let encoderWorker = null;
   let workerBroken = false;
   const ENCODE_CHUNK = 49152; // 3 的倍数：分块 btoa 再拼接 == 整体 btoa
@@ -122,8 +123,18 @@
     try {
       const url = URL.createObjectURL(new Blob([WORKER_SRC], { type: 'text/javascript' }));
       const w = new Worker(url);
-      // 出错就永久退回主线程那条路（不要每条都重试、也不给页面抛异常）
-      w.onerror = () => { workerBroken = true; encoderWorker = null; };
+      // 出错就永久退回主线程那条路（不要每条都重试、也不给页面抛异常）。
+      // ⚠️ 这里**必须把手里那一段接回来**：Worker 挂掉时（例如页面 CSP 不允许 blob worker，
+      // 它是**异步**报错的）如果不复位 inFlight，pump 再也不会跑 —— 后面所有 append 全丢，
+      // 抓到的字节流中间就缺一大块，解码时表现为"整组字节都是垃圾"（用户实测过）。
+      w.onerror = () => {
+        workerBroken = true;
+        encoderWorker = null;
+        const stuck = inFlightItem;
+        inFlight = false;
+        inFlightItem = null;
+        if (stuck) encodeOnMainThread(stuck);
+      };
       URL.revokeObjectURL(url);
       encoderWorker = w;
     } catch {
@@ -180,8 +191,10 @@
     const w = ensureWorker();
     if (!w) { encodeOnMainThread(item); return; }
     inFlight = true;
+    inFlightItem = item;
     w.onmessage = (e) => {
       inFlight = false;
+      inFlightItem = null;
       deliver(item, typeof e.data === 'string' ? e.data : '');
     };
     try {
@@ -190,6 +203,7 @@
       w.postMessage(item.view);
     } catch {
       inFlight = false;
+      inFlightItem = null;
       workerBroken = true;
       encodeOnMainThread(item);
     }
