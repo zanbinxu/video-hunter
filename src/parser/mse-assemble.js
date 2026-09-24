@@ -155,36 +155,54 @@ export function contentTypeFromMime(mime) {
  * @returns {{groups: Array, duplicates: number}}
  */
 export function groupBuffers(items) {
-  const map = new Map();
-  const seen = new Set();
-  let duplicates = 0;
-
   const sorted = [...items].sort((a, b) => a.seq - b.seq);
+
+  // 第一遍：先按"流"（mime / 编号）归并，并记下这条流里出现过几种**识别得出来**的容器。
+  const byKey = new Map();
   for (const item of sorted) {
     if (!item?.bytes?.byteLength) continue;
     const mime = item.mime || '';
     // 有 mime 就按 mime 分（播放器重建 SourceBuffer 时还是同一条轨，要合在一起）；
     // 没 mime 只能按编号分（那是几条不同的流）。
     const key = mime || `sb:${item.sbId || '未知'}`;
-    // 再按**容器**分一层：播放器可以在同一条 SourceBuffer 上 `changeType()` 换容器，
-    // 于是同一个 mime 下混着两种格式（用户实测：视频流里 webm 6MB + fmp4 63MB）。
-    // 不分层的话，解析器只认第一种，换容器之后的整段都解析不出来、被整段丢掉。
-    // kind 缺省（老的调用方、单元测试）时行为与以前完全一致。
-    const kind = item.kind && item.kind !== 'unknown' ? item.kind : '';
-    const groupKey = kind ? `${key}|${kind}` : key;
+    if (!byKey.has(key)) byKey.set(key, { mime, sbId: item.sbId || '', items: [], kinds: new Set() });
+    const g = byKey.get(key);
+    g.items.push(item);
+    if (item.kind && item.kind !== 'unknown') g.kinds.add(item.kind);
+  }
 
-    // 判重也按分组来：同一条流的重复分片要去掉，
-    // 但两条不同的流里"碰巧一样"的分片不能互相顶掉。
-    const fingerprintKey = `${groupKey}#${fingerprint(item.bytes)}`;
-    if (seen.has(fingerprintKey)) { duplicates += 1; continue; }
-    seen.add(fingerprintKey);
+  // 第二遍：**只有**这条流确实出现过两种以上识别出来的容器（= 播放器真的换了容器）
+  // 才按容器拆开；否则原样一组。
+  //
+  // ⚠️ 这里踩过一次大坑（用户："怎么越改越不行"）：第一版是"每个 item 各自按 kind 分"，
+  // 于是**认不出容器的那几段**（抓流从中间开始、或分片从中间续上，sniff 成 unknown）
+  // 会被放进一个没后缀的组，而后面认得出的段进另一个组 —— 同一条流的头和身子被切成
+  // 两组**残数据**，两组都拼不出完整文件（用户实测：收到 141MB 画面、四组全残、
+  // 导出只剩音频）。现在 unknown 永远跟着它前面那一段走，且"只有一种容器就不拆"。
+  const map = new Map();
+  const seen = new Set();
+  let duplicates = 0;
+  for (const [key, g] of byKey) {
+    const split = g.kinds.size > 1;
+    let currentKind = '';
+    for (const item of g.items) {
+      if (item.kind && item.kind !== 'unknown') currentKind = item.kind;
+      const kind = split ? (currentKind || 'unknown') : '';
+      const groupKey = kind ? `${key}|${kind}` : key;
 
-    if (!map.has(groupKey)) {
-      map.set(groupKey, { mime, sbId: item.sbId || '', kind, chunks: [], bytes: 0 });
+      // 判重也按分组来：同一条流的重复分片要去掉，
+      // 但两条不同的流里"碰巧一样"的分片不能互相顶掉。
+      const fingerprintKey = `${groupKey}#${fingerprint(item.bytes)}`;
+      if (seen.has(fingerprintKey)) { duplicates += 1; continue; }
+      seen.add(fingerprintKey);
+
+      if (!map.has(groupKey)) {
+        map.set(groupKey, { mime: g.mime, sbId: g.sbId, kind, chunks: [], bytes: 0 });
+      }
+      const grp = map.get(groupKey);
+      grp.chunks.push(item.bytes);
+      grp.bytes += item.bytes.byteLength;
     }
-    const g = map.get(groupKey);
-    g.chunks.push(item.bytes);
-    g.bytes += item.bytes.byteLength;
   }
 
   return { groups: [...map.values()], duplicates };
