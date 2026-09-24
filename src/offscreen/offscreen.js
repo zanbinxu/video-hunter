@@ -321,6 +321,14 @@ function mseStart(msg = {}) {
     // 每条流（分组键 → video/audio）先前分析出来的大类：给"只有分片"的那一组
     // 认领初始化段时用（见 assembleMseCapture 里的注释）
     seenStreamType: new Map(),
+    // 每条流**实际收到的容器**各自多少字节：`${分组键}|${容器}` → 字节数。
+    //
+    // 为什么要它：播放器可以在**同一条 SourceBuffer 上 `changeType()`**，把这条流
+    // 从 WebM 换成 fMP4（或反过来）—— 分组键还是老 mime，字节却换了容器。
+    // 于是"在 WebM 里找 Cluster"再也找不到，后面整段丢（用户实测丢了 106 MB 画面）。
+    // 在收到的那一刻按容器记一笔，提示卡就能直接说清"这一组里混了两种容器"，
+    // 而不是让人对着一串十六进制猜。
+    containerBytes: new Map(),
     statsTimer: null,
   };
   // 每秒报一次进度。抓流是"边播边收"，用户需要看到它确实在动 ——
@@ -704,6 +712,14 @@ function mseBuffer(msg) {
     mse.dropped += 1;
     return { ok: false, error: `base64 解码失败：${err?.message || err}` };
   }
+  // 收到的那一刻就记一笔"这一段是什么容器"（O(1) 的魔数判断）。
+  // 分组键用的是 mime/编号，而播放器能在同一条 SourceBuffer 上换容器 ——
+  // 所以"键相同、容器不同"这件事必须在这一层才能看见（见 containerBytes 的注释）。
+  const key = msg.mime || `sb:${msg.sbId || ''}`;
+  const kind = sniffContainer(bytes);
+  const tallyKey = `${key}|${kind}`;
+  mse.containerBytes.set(tallyKey, (mse.containerBytes.get(tallyKey) || 0) + bytes.byteLength);
+
   mse.items.push({ seq: Number(msg.seq) || 0, mime: msg.mime || '', sbId: msg.sbId || '', bytes });
   mse.bytes += bytes.byteLength;
   trackMediaTime(mse, msg.mime, msg.sbId, bytes);
@@ -1004,6 +1020,38 @@ async function finishAssembly(s, ctx) {
   let { video, audio } = ctx;
   const warnings = [];
   let transcoded = null;
+  // 诊断：这次到底收到了**哪几组**、各多大。
+  // 用户报"画面少了一截"时，这一行先把范围缩一半：是"只收到一组（那就是这条流本身缺）"
+  // 还是"收了好几组但只用了其中一组"（那条是另一个已知缺陷）。
+  if (analyzed.length > 1) {
+    warnings.push(`这次收到 ${analyzed.length} 组数据：`
+      + analyzed.map((a) => `${a.container}/${a.contentType || a.mime || '?'}`
+        + ` ${Math.round(a.bytes / 1048576)}MB`).join(' + '));
+  }
+  // 同一条流收到两种**识别出来的**容器 = 播放器在同一个 SourceBuffer 上换了容器
+  // （changeType）。解析器只会认第一种，换之后的整段都解析不出来 —— 用户实测丢了 106 MB 画面。
+  //
+  // ⚠️ 两个坑（第一版都踩了，靠浏览器回归的日志才发现）：
+  //   · `webm-no-init` 只是"这一段的头没抓到"，**同一个容器**，要归一成 webm；
+  //   · `unknown` 是"分片被切成两段、这段从中间续上"的正常情况，要忽略。
+  //   不这么处理，正常抓流也会被判成"换了容器"，那就成了狼来了。
+  const byStream = new Map();
+  for (const [k, n] of s.containerBytes || []) {
+    const [stream, rawKind] = k.split('|');
+    const kind = rawKind === 'webm-no-init' ? 'webm' : rawKind;
+    if (!byStream.has(stream)) byStream.set(stream, new Map());
+    const m = byStream.get(stream);
+    m.set(kind, (m.get(kind) || 0) + n);
+  }
+  for (const [stream, kinds] of byStream) {
+    const recognized = [...kinds.keys()].filter((k) => k !== 'unknown');
+    if (new Set(recognized).size > 1) {
+      warnings.push(`同一条流（${stream}）中途换了容器：`
+        + recognized.map((k) => `${k} ${Math.round(kinds.get(k) / 1048576)}MB`).join(' + ')
+        + ' —— 播放器在同一个 SourceBuffer 上换了格式，换之后的字节按老格式解析不出来，'
+        + '所以那一段之后的画面没进产物');
+    }
+  }
   // 拆出来的 WebM 轨道（画面 + 音频），走"存成 .webm"那条路
   const webmVideoTracks = [];
   const webmAudioTracks = [];

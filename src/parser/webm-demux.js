@@ -235,21 +235,90 @@ const SEGMENT_CHILD_IDS = new Set([
  * 只要找到下一个 Cluster 的起点（`1F 43 B6 75`）就能接着读。
  *
  * 判据两道，防止把 Block 载荷里凑巧出现的字节当成 Cluster：
- *   1. 元素头要自洽（长度字段不越界）；
- *   2. Cluster 的第一个子元素应当是 `Timestamp`（规范要求每个 Cluster 都带它，
- *      各家 muxer 也都写在最前面）—— 这一条能挡掉绝大多数巧合。
+ *   1. 元素头要自洽（长度字段不越界），且第一个子元素是 Cluster 里合法的那几种；
+ *   2. **链式校验**：这个 Cluster 之后紧接着的那个元素也得像样（真 Cluster 的下一个
+ *      就是下一个 Cluster）。这一条比"认 Timestamp 在第一位"稳 —— 后者栽过一次：
+ *      规范要求 Cluster 带 Timestamp，但**位置不固定**（muxer 常把 PrevSize/Position
+ *      写在它前面），第一版只认"第一个子元素是 Timestamp"，用户真实流里一个都没匹配上。
  *
  * @returns {number|null} 下一个 Cluster 的偏移；找不到返回 null（调用方按"读不动"上报）
  */
-function resyncToNextCluster(bytes, from, end) {  for (let at = Math.max(0, from); at + 5 <= end; at += 1) {
+
+/** Cluster 里合法的子元素 id（用于判断"这个 Cluster 是不是真的"） */
+const CLUSTER_CHILD_IDS = new Set([
+  0xe7, // Timestamp
+  0xab, // PrevSize
+  0xa7, // Position
+  0xa3, // SimpleBlock
+  0xa0, // BlockGroup
+  0xec, // Void
+]);
+
+/** 前 N 个字节的十六进制 —— 诊断用：把"读不动的那一段到底是什么"带出来 */
+function hexPreview(bytes, at, count = 24) {
+  const out = [];
+  for (let i = at; i < Math.min(bytes.length, at + count); i += 1) {
+    out.push(bytes[i].toString(16).padStart(2, '0'));
+  }
+  return out.join(' ');
+}
+
+/**
+ * 读不动的那一段"看起来是什么"。
+ *
+ * 为什么要它：用户真实流的提示卡只写了"还剩 106630635 字节没读"，光看这个数字
+ * 分不清是"没找到 Cluster"还是"这一段根本不是 WebM"：
+ *   · 找到 `moof`/`ftyp` → 播放器中途**换了容器**（changeType 把这条流从 WebM 换成了 fMP4），
+ *     那我们该做的是"按容器分段解析"，而不是在 WebM 里找 Cluster；
+ *   · 找到 `1a45dfa3` → 又来了一份 init（那条路已经能处理）；
+ *   · 找到 `1f43b675` → Cluster 标记**在**，是校验太严或长度字段被写坏；
+ *   · 什么都没有 → 认不出的字节。
+ * 前 1 MB 里找，够判断了。
+ */
+function describeTail(bytes, from, end) {
+  const limit = Math.min(end, from + (1 << 20));
+  const find = (sig) => {
+    for (let at = from; at + sig.length <= limit; at += 1) {
+      let hit = true;
+      for (let k = 0; k < sig.length; k += 1) {
+        if (bytes[at + k] !== sig[k]) { hit = false; break; }
+      }
+      if (hit) return at - from;
+    }
+    return -1;
+  };
+  const out = [];
+  const at = (n) => (n >= 0 ? `+${n}` : null);
+  const moof = find([0x6d, 0x6f, 0x6f, 0x66]);
+  const ftyp = find([0x66, 0x74, 0x79, 0x70]);
+  const styp = find([0x73, 0x74, 0x79, 0x70]);
+  const init = find([0x1a, 0x45, 0xdf, 0xa3]);
+  const cluster = find([0x1f, 0x43, 0xb6, 0x75]);
+  if (moof >= 0 || ftyp >= 0 || styp >= 0) {
+    out.push(`看起来是 fMP4（moof ${at(moof) || '无'}／ftyp ${at(ftyp) || '无'}）`
+      + '—— 播放器中途换了容器，这一段该按 fMP4 解析，而不是在 WebM 里找 Cluster');
+  }
+  if (init >= 0) out.push(`有一份新的 WebM init（${at(init)}）`);
+  if (cluster >= 0) out.push(`有 Cluster 标记（${at(cluster)}）但没通过校验`);
+  return out.length ? out.join('；') : '前 1 MB 里既没有 Cluster 标记、也没有 fMP4 标记（认不出是什么字节）';
+}
+
+function resyncToNextCluster(bytes, from, end) {
+  for (let at = Math.max(0, from); at + 5 <= end; at += 1) {
     if (bytes[at] !== 0x1f || bytes[at + 1] !== 0x43 || bytes[at + 2] !== 0xb6 || bytes[at + 3] !== 0x75) continue;
     const head = readHeader(bytes, at);
     if (!head || head.id !== EBML_ID.Cluster || head.unknownSize) continue;
     const payloadEnd = head.payloadStart + head.size;
     if (payloadEnd <= head.payloadStart || payloadEnd > end) continue;
+    // ① 第一个子元素得是 Cluster 里合法的那几种（**不限定必须是 Timestamp**）
     const child = readHeader(bytes, head.payloadStart);
-    if (!child || child.id !== EBML_ID.Timestamp) continue;
+    if (!child || !CLUSTER_CHILD_IDS.has(child.id)) continue;
     if (child.unknownSize || child.payloadStart + child.size > payloadEnd) continue;
+    // ② 链式校验：紧接着的那个元素也得像样
+    if (payloadEnd + 2 <= end) {
+      const after = readHeader(bytes, payloadEnd);
+      if (!after || !SEGMENT_CHILD_IDS.has(after.id)) continue;
+    }
     return at;
   }
   return null;
@@ -283,7 +352,7 @@ function* walkSegmentContent(bytes, start, declaredEnd, end, onNote) {
         if (next > limit) limit = end; // 越过声明范围就放开，别把救回来的数据又卡掉
         continue;
       }
-      onNote({ at: pos, bytes: limit - pos, broken: true });
+      onNote({ at: pos, bytes: limit - pos, broken: true, preview: hexPreview(bytes, pos), tail: describeTail(bytes, pos, end) });
       return;
     }
     if (head.id === EBML_ID.EBML || head.id === EBML_ID.Segment) {
@@ -305,7 +374,7 @@ function* walkSegmentContent(bytes, start, declaredEnd, end, onNote) {
         if (next > limit) limit = end;
         continue;
       }
-      onNote({ at: pos, bytes: limit - pos, broken: true });
+      onNote({ at: pos, bytes: limit - pos, broken: true, preview: hexPreview(bytes, pos), tail: describeTail(bytes, pos, end) });
       return;
     }
     // 长度未知的元素：规范里只允许 Segment（这里不该出现，见上面的重新初始化）
@@ -319,12 +388,12 @@ function* walkSegmentContent(bytes, start, declaredEnd, end, onNote) {
         if (next > limit) limit = end;
         continue;
       }
-      onNote({ at: pos, bytes: limit - pos, broken: true });
+      onNote({ at: pos, bytes: limit - pos, broken: true, preview: hexPreview(bytes, pos), tail: describeTail(bytes, pos, end) });
       return;
     }
     const payloadEnd = Math.min(limit, head.payloadStart + head.size);
     if (payloadEnd < head.payloadStart) {
-      onNote({ at: pos, bytes: limit - pos, broken: true });
+      onNote({ at: pos, bytes: limit - pos, broken: true, preview: hexPreview(bytes, pos), tail: describeTail(bytes, pos, end) });
       return;
     }
     yield { ...head, payloadEnd };
@@ -345,7 +414,7 @@ function* walkSegmentContent(bytes, start, declaredEnd, end, onNote) {
   // 收尾也要交代清楚：还有没读的字节就必须说一声 —— 用户报的那次
   // "画面只剩前 17 秒、后面 175 MB 没进产物"以前就是这样静默丢掉的。
   if (pos + 2 <= end) {
-    onNote({ at: pos, bytes: end - pos, broken: true });
+    onNote({ at: pos, bytes: end - pos, broken: true, preview: hexPreview(bytes, pos), tail: describeTail(bytes, pos, end) });
   }
 }
 
@@ -715,6 +784,7 @@ export function demuxWebm(bytes) {
   }
   if (broken && warnings.length < 5) {
     warnings.push(`读到第 ${clusters} 个 Cluster 之后读不动了（还剩 ${broken.bytes} 字节没读）：`
+      + `开头是 [${broken.preview || '?'}]，${broken.tail || ''} —— `
       + '这一段后面的内容没有进产物，这一份可能少了一截');
   }
 
