@@ -133,6 +133,17 @@ export function mergeWebm(input = {}) {
  * 这里两条轨的最后一帧我们都摸过，直接算最准。
  */
 export function webmDurationSeconds(tracks = []) {
+  // ⚠️ 必须和 mergeWebm 一样**整体减掉最早的起点**：从中间开始抓流时，
+  // 帧的时间戳是源流的绝对时间，不减就会把"源流时间轴的长度"当时长。
+  // 用户实测：产物只有 30 秒，管理页却显示 18:31（他当时播到第 18 分钟才开始抓），
+  // 于是"录了 7 分钟怎么才 6.8 MB"这个误会就是这么来的。
+  let originUs = Infinity;
+  for (const track of tracks) {
+    const first = (track?.frames || [])[0];
+    if (first) originUs = Math.min(originUs, first.timeUs);
+  }
+  const shift = Number.isFinite(originUs) ? originUs : 0;
+
   let endUs = 0;
   for (const track of tracks) {
     const frames = track?.frames || [];
@@ -140,5 +151,5 @@ export function webmDurationSeconds(tracks = []) {
     if (!last) continue;
     endUs = Math.max(endUs, last.timeUs + (last.durationUs || 0));
   }
-  return endUs > 0 ? endUs / 1e6 : null;
+  return endUs > 0 ? Math.max(0, endUs - shift) / 1e6 : null;
 }

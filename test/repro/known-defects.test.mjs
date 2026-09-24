@@ -401,8 +401,7 @@ test('P1（行为）中途重发 init 时，后面的内容不能凭空消失', 
  * 期望：**6 个 Cluster 的内容全在**（150 帧）；修复前只有前半段（75 帧）。
  * ------------------------------------------------------------------ */
 
-test('P1-b（行为）真实形态：前半段 + 变过的 init + 后半段，内容一个不少', () => {
-  const init = bytesOf('webm-vp9', 'video-init.webm');
+test('P1-b（行为）真实形态：前半段 + 变过的 init + 后半段，内容一个不少', () => {  const init = bytesOf('webm-vp9', 'video-init.webm');
   const clusters = bytesOf('webm-vp9', 'video-clusters.webm');
 
   // 按 EBML 长度字段在**某个 Cluster 边界**上切（不猜字节）
@@ -452,5 +451,71 @@ test('P1-b（行为）真实形态：前半段 + 变过的 init + 后半段，�
   assert.ok(
     (d.warnings || []).some((w) => /初始化段/.test(w)),
     '中途真的重新初始化过时，产物提示里应当写一句（不能静默）',
+  );
+});
+
+/* ------------------------------------------------------------------ *
+ * P2：字节流错位之后，**剩下的 Cluster 要救回来**
+ *
+ * 用户 2026-09-24 第二次报的（"拖完只有声音没有画面"）。产物提示原文：
+ *
+ *   读到第 3 个 Cluster 之后读不动了（还剩 175780230 字节没读）：
+ *   这一段后面的内容没有进产物，这一份可能少了一截
+ *
+ * 也就是说：视频那组字节流从错位点开始解析失败，**后面 175 MB 全被丢掉**，
+ * 而音频那条流是好的 —— 于是"声音全、画面只有前 17 秒"。
+ *
+ * 但那些字节大部分是好的：Cluster 自包含，找到下一个 Cluster 起点就能接着读。
+ * 这里在**某个 Cluster 内部**删掉 40 字节来造错位（等价于某一段 append 丢了或重叠了）。
+ * 实测：完好 150 帧；修复前只剩 25 帧且**零警告**（连"读不动"都没报，因为错位点读到的
+ * 是个"看起来合法、长度超大"的元素，把后面一口吞了）；修复后救回 100 帧，并明确报出
+ * 「有 1 处字节流对不齐（共跳过 N 字节）」。
+ * ------------------------------------------------------------------ */
+
+test('P2（行为）字节流错位之后，剩下的 Cluster 要救回来', () => {
+  const init = bytesOf('webm-vp9', 'video-init.webm');
+  const clusters = bytesOf('webm-vp9', 'video-clusters.webm');
+  const whole = demuxWebm(concatBytes(init, clusters)).tracks[0].frames.length;
+  assert.ok(whole > 50, `前提：完好样本应当有几十帧，实际 ${whole}`);
+
+  // 按 EBML 长度字段找 Cluster 边界，在**第 2 个 Cluster 内部**删掉 40 字节
+  const readVint = (b, at) => {
+    const first = b[at];
+    if (!first) return null;
+    let len = 1;
+    while (len <= 8 && !(first & (0x80 >> (len - 1)))) len += 1;
+    if (len > 8 || at + len > b.length) return null;
+    let value = first & (0xff >> len);
+    for (let i = 1; i < len; i += 1) value = value * 256 + b[at + i];
+    return { len, value };
+  };
+  const starts = [];
+  let at = 0;
+  while (at + 2 <= clusters.length) {
+    const id = readVint(clusters, at);
+    if (!id) break;
+    const size = readVint(clusters, at + id.len);
+    if (!size) break;
+    const end = at + id.len + size.len + size.value;
+    if (end > clusters.length) break;
+    starts.push(at);
+    at = end;
+  }
+  assert.ok(starts.length >= 4, `前提：样本里应当有多个 Cluster，实际 ${starts.length}`);
+
+  const cut = starts[1] + 10;
+  const damaged = concatBytes(clusters.slice(0, cut), clusters.slice(cut + 40));
+  const d = demuxWebm(concatBytes(init, damaged));
+  const frames = d.tracks[0]?.frames?.length ?? 0;
+
+  assert.ok(
+    frames >= whole * 0.4,
+    `字节流在第 2 个 Cluster 里错位之后，只解出 ${frames} 帧（完好时 ${whole} 帧）——`
+    + '说明错位点后面那些**本来是好的** Cluster 被整段丢掉了。'
+    + `（用户现场丢的是 175 MB 画面，产物只剩前 17 秒）warnings=${JSON.stringify(d.warnings || [])}`,
+  );
+  assert.ok(
+    (d.warnings || []).some((w) => /对不齐|跳过/.test(w)),
+    '发生过重新对齐时，产物提示里必须写一句（不能静默）',
   );
 });

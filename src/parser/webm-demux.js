@@ -200,6 +200,62 @@ function skipReinitialization(bytes, head, end) {
 }
 
 /**
+ * Segment 里**合法**的子元素 id。
+ *
+ * 用途：字节流错位之后，常在错位点读到一个"看起来合法、其实不属于这里"的元素
+ * （用户那次就是：它声明了一个超大长度，把后面 175 MB 一口吞掉，而且**不报错**）。
+ * 规范里 Segment 的子元素就那么几种，出现别的 id 就是错位的铁证 ——
+ * 这比"长度太大就怀疑"之类的启发式稳得多，也不会误伤正常的 Cues/Tags。
+ */
+const SEGMENT_CHILD_IDS = new Set([
+  EBML_ID.EBML, EBML_ID.Segment, EBML_ID.SeekHead, EBML_ID.Info,
+  EBML_ID.Tracks, EBML_ID.Cluster,
+  0x1c53bb6b, // Cues
+  0x1043a770, // Chapters
+  0x1254c367, // Tags
+  0x1941a469, // Attachments
+  0xec, // Void（填充，规范允许）
+]);
+
+/**
+ * 字节流对不齐时，往前找**下一个真正的 Cluster**。
+ *
+ * ## 为什么需要它（用户 2026-09-24 第二次报的："只有声音没有画面"）
+ *
+ * 抓到的是一串 `appendBuffer` 的字节首尾相接。真实站点上这一串会因为
+ * "少了一段"或"重复/重叠了一段"而**错位**：从错位那一点开始，解析器读到的东西
+ * 不再符合 WebM 的元素结构（`readHeader` 直接失败）。
+ *
+ * 以前遇到这种情况就是**后面整段不要**：用户的产物里第 3 个 Cluster 之后
+ * **175 MB 画面全被丢掉**（提示原文：「读到第 3 个 Cluster 之后读不动了
+ * （还剩 175780230 字节没读）」），而音频那条流是好的 —— 于是变成
+ * "声音全、画面只有前 17 秒"。
+ *
+ * 但那些字节**大部分是好的**，只是从错位点开始"读法"错了。Cluster 是自包含的，
+ * 只要找到下一个 Cluster 的起点（`1F 43 B6 75`）就能接着读。
+ *
+ * 判据两道，防止把 Block 载荷里凑巧出现的字节当成 Cluster：
+ *   1. 元素头要自洽（长度字段不越界）；
+ *   2. Cluster 的第一个子元素应当是 `Timestamp`（规范要求每个 Cluster 都带它，
+ *      各家 muxer 也都写在最前面）—— 这一条能挡掉绝大多数巧合。
+ *
+ * @returns {number|null} 下一个 Cluster 的偏移；找不到返回 null（调用方按"读不动"上报）
+ */
+function resyncToNextCluster(bytes, from, end) {  for (let at = Math.max(0, from); at + 5 <= end; at += 1) {
+    if (bytes[at] !== 0x1f || bytes[at + 1] !== 0x43 || bytes[at + 2] !== 0xb6 || bytes[at + 3] !== 0x75) continue;
+    const head = readHeader(bytes, at);
+    if (!head || head.id !== EBML_ID.Cluster || head.unknownSize) continue;
+    const payloadEnd = head.payloadStart + head.size;
+    if (payloadEnd <= head.payloadStart || payloadEnd > end) continue;
+    const child = readHeader(bytes, head.payloadStart);
+    if (!child || child.id !== EBML_ID.Timestamp) continue;
+    if (child.unknownSize || child.payloadStart + child.size > payloadEnd) continue;
+    return at;
+  }
+  return null;
+}
+
+/**
  * 走 Segment 的内容，并处理两种"按声明长度走会丢数据"的情形：
  *
  *  1. **中途又发了一份 init**（见 `skipReinitialization`）：认出它、跳过它自己的
@@ -219,6 +275,14 @@ function* walkSegmentContent(bytes, start, declaredEnd, end, onNote) {
   for (let guard = 0; guard < 1e6 && pos + 2 <= limit; guard += 1) {
     const head = readHeader(bytes, pos);
     if (!head) {
+      // 错位了：先试试**重新对齐**（下一个 Cluster 就在附近，那些字节大多还是好的）
+      const next = resyncToNextCluster(bytes, pos + 1, end);
+      if (next != null) {
+        onNote({ at: pos, bytes: next - pos, resync: true });
+        pos = next;
+        if (next > limit) limit = end; // 越过声明范围就放开，别把救回来的数据又卡掉
+        continue;
+      }
       onNote({ at: pos, bytes: limit - pos, broken: true });
       return;
     }
@@ -232,10 +296,38 @@ function* walkSegmentContent(bytes, start, declaredEnd, end, onNote) {
       pos = next;
       continue;
     }
-    const payloadEnd = head.unknownSize ? limit : Math.min(limit, head.payloadStart + head.size);
-    if (payloadEnd < head.payloadStart) return;
+    // Segment 里出现了不属于这里的元素 id → 字节流错位了（不是"读不动"，是"读歪了"）
+    if (!SEGMENT_CHILD_IDS.has(head.id)) {
+      const next = resyncToNextCluster(bytes, pos + 1, end);
+      if (next != null) {
+        onNote({ at: pos, bytes: next - pos, resync: true });
+        pos = next;
+        if (next > limit) limit = end;
+        continue;
+      }
+      onNote({ at: pos, bytes: limit - pos, broken: true });
+      return;
+    }
+    // 长度未知的元素：规范里只允许 Segment（这里不该出现，见上面的重新初始化）
+    // 和**直播流的 Cluster**（它靠"下一个 Cluster 的 ID"来断）。
+    // 抓到的字节错位时也会在这里冒出来 —— 以前直接 `return`，于是**静默**丢掉后面全部。
+    if (head.unknownSize) {
+      const next = resyncToNextCluster(bytes, head.payloadStart + 1, end);
+      if (next != null) {
+        onNote({ at: pos, bytes: next - pos, resync: true });
+        pos = next;
+        if (next > limit) limit = end;
+        continue;
+      }
+      onNote({ at: pos, bytes: limit - pos, broken: true });
+      return;
+    }
+    const payloadEnd = Math.min(limit, head.payloadStart + head.size);
+    if (payloadEnd < head.payloadStart) {
+      onNote({ at: pos, bytes: limit - pos, broken: true });
+      return;
+    }
     yield { ...head, payloadEnd };
-    if (head.unknownSize) return;
     pos = payloadEnd;
   }
   // 声明范围走完了，缓冲里却还有数据：只有确实还是 Cluster / init 才继续，
@@ -247,7 +339,13 @@ function* walkSegmentContent(bytes, start, declaredEnd, end, onNote) {
     if (looksLikeData) {
       onNote({ at: pos, bytes: end - pos, short: true });
       yield* walkSegmentContent(bytes, pos, end, end, onNote);
+      return;
     }
+  }
+  // 收尾也要交代清楚：还有没读的字节就必须说一声 —— 用户报的那次
+  // "画面只剩前 17 秒、后面 175 MB 没进产物"以前就是这样静默丢掉的。
+  if (pos + 2 <= end) {
+    onNote({ at: pos, bytes: end - pos, broken: true });
   }
 }
 
@@ -600,7 +698,13 @@ export function demuxWebm(bytes) {
   // 产物短了一大截，界面上却写着"成功"，用户只能自己发现"后半段没画面"。
   const reinits = demuxNotes.filter((n) => n.reinit && !n.broken);
   const shorts = demuxNotes.filter((n) => n.short);
+  const resyncs = demuxNotes.filter((n) => n.resync);
   const broken = demuxNotes.find((n) => n.broken);
+  if (resyncs.length && warnings.length < 5) {
+    const skipped = resyncs.reduce((sum, n) => sum + n.bytes, 0);
+    warnings.push(`有 ${resyncs.length} 处字节流对不齐（共跳过 ${skipped} 字节）：`
+      + '已经从下一个 Cluster 接着读 —— 中间那一段可能少了一点内容');
+  }
   if (reinits.length && warnings.length < 5) {
     warnings.push(`播放器中途又发了一份初始化段（${reinits.length} 处）：`
       + '已经跳过它、接着读后面的内容（这是换码率/拖进度时播放器的正常动作）');
@@ -632,8 +736,10 @@ export function demuxWebm(bytes) {
     clusters,
     skippedBlocks,
     warnings,
-    // 中途重发 init 的处数、以及"读不动了"剩下的字节数 —— 给上层做诊断/提示用
+    // 中途重发 init 的处数、"重新对齐"救回来的处数、以及"读不动了"剩下的字节数
+    // —— 给上层做诊断/提示用
     reinitCount: reinits.length,
+    resyncCount: resyncs.length,
     unparsedBytes: broken ? broken.bytes : 0,
   };
 }
