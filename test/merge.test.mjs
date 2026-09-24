@@ -694,13 +694,15 @@ function retargetFragment(bytes, trackId) {
  * 为什么值得钉住：将来谁去改边界识别，都必须先看到这条用例、明确知道自己在
  * 改变什么。去掉它之前，请先想清楚用户要的是"一集一个文件"还是别的。
  */
-test('同页换集：第二集与第一集重叠的样本被丢掉，超出末尾的会被接上（当前真实行为）', () => {
+test('判重那一层：第二集与第一集重叠的样本被丢掉，超出末尾的会留在时间轴上', () => {
   const ep = (n) => Array.from({ length: n }, (_, i) => ({ dts: i * 100, duration: 100, data: null }));
 
   // 第一集 4 个样本（0/100/200/300），第二集 6 个样本（0/100/200/300/400/500）
   const { samples, dropped } = normalizeTrackSamples([...ep(4), ...ep(6)]);
 
   // 前 4 个来自第二集、但和第一集完全重叠 → 丢掉；第二集多出来的 400/500 被接上
+  // （⚠️ 这**只是判重那一层**的行为：抓流那条路接着会用 truncateAtTimelineRestart
+  //   把「时间轴重新从头开始」之后的样本整段切掉，见下面两条用例。）
   assert.equal(dropped, 4);
   assert.deepEqual(samples.map((s) => s.dts), [0, 100, 200, 300, 400, 500]);
 
