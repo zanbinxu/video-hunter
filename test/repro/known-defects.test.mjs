@@ -472,6 +472,36 @@ test('P1-b（行为）真实形态：前半段 + 变过的 init + 后半段，�
  * 「有 1 处字节流对不齐（共跳过 N 字节）」。
  * ------------------------------------------------------------------ */
 
+test('P3（行为）同一条流中途换了容器：按容器拆开，而不是拼成一个认不出的组', () => {
+  const webm = bytesOf('webm-vp9', 'video.webm');
+  const fmp4 = bytesOf('dash-split', 'chunk-stream0-00001.m4s');
+  // 关键：**mime 不变**（播放器没有重建 SourceBuffer，只是在同一条上 changeType 换了容器），
+  // 只有每一段自己 sniff 出来的容器不同。用户实测就是这么丢的 63MB。
+  const mime = 'video/webm; codecs="vp09.00.51.08"';
+  const items = [
+    { seq: 0, mime, bytes: webm, kind: 'webm' },
+    { seq: 1, mime, bytes: fmp4, kind: 'fmp4' },
+  ];
+
+  const { groups } = groupBuffers(items);
+  assert.equal(groups.length, 2, '两种容器必须拆成两组 —— 拼在一起的话解析器只认第一种、另一种整段丢');
+
+  const analyzed = groups.map(analyzeGroup);
+  assert.ok(
+    analyzed.some((a) => a.container === 'webm'),
+    `拆出来的组里应当有 WebM 那一组：${JSON.stringify(analyzed.map((a) => a.container))}`,
+  );
+  assert.ok(
+    analyzed.some((a) => a.container === 'fmp4'),
+    `拆出来的组里应当有 fMP4 那一组（以前它会被当成坏掉的 WebM 丢掉）：`
+    + `${JSON.stringify(analyzed.map((a) => a.container))}`,
+  );
+
+  // 老调用方（不带 kind）行为完全不变：还是一组
+  const legacy = groupBuffers(items.map(({ kind, ...rest }) => rest));
+  assert.equal(legacy.groups.length, 1, '没有 kind 时不能改变原有分组行为');
+});
+
 test('P2（行为）字节流错位之后，剩下的 Cluster 要救回来', () => {
   const init = bytesOf('webm-vp9', 'video-init.webm');
   const clusters = bytesOf('webm-vp9', 'video-clusters.webm');

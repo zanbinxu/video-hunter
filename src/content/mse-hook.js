@@ -41,22 +41,6 @@
     }
   };
 
-  /**
-   * 在主世界就把字节编码成 base64。
-   *
-   * 一开始是把 ArrayBuffer 用 transfer 递到隔离世界再编码 —— 实测那一步
-   * 送过来的字节是空的（跨世界传二进制不可靠）。改成在这边编码成字符串，
-   * 跨世界传字符串是最稳的。代价是页面上多花一两毫秒，可以接受。
-   */
-  function toBase64(bytes) {
-    let s = '';
-    const CHUNK = 0x8000;
-    for (let i = 0; i < bytes.length; i += CHUNK) {
-      s += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
-    }
-    return btoa(s);
-  }
-
   const describe = (data) => {
     if (data instanceof ArrayBuffer) return new Uint8Array(data);
     if (ArrayBuffer.isView(data)) {
@@ -96,25 +80,90 @@
     };
   } catch { /* 有些环境没有 MediaSource，正常 */ }
 
-  /* ---- 2. 钩 appendBuffer ---- */
+  /* ---- 2. 钩 appendBuffer（**绝不能堵住页面**）----
+   *
+   * 用户报的："每次刷新页面后的第一次抓流，页面完全不动（转圈/黑屏），停止保存之后才恢复。"
+   *
+   * 原因：原来在 appendBuffer 里**同步**做 base64（`String.fromCharCode` 拼字符串 + `btoa`，
+   * 两遍全量遍历）再 `postMessage` 一个大字符串。刷新后的第一次抓流恰好是播放器
+   * **重新下载、重新缓冲**的时刻 —— 一瞬间 append 进来好几 MB，主线程被编码堵死，
+   * 视频管线自然卡住。第二次抓流数据是匀速来的，就看不出问题。
+   *
+   * 现在：appendBuffer 里**只拷一份字节**（一次 memcpy，很快）丢进队列、立刻放行页面；
+   * 编码与 postMessage 交给队列，并且**每编码 48 KB 就让出主线程一次**（setTimeout 0），
+   * 让播放器有机会跑。顺序仍然严格 FIFO，消息格式与之前完全一致。
+   *
+   * 为什么每块是 48 KB：**3 的倍数**，所以"每块单独 btoa 再拼接"与"整体 btoa"等价 ——
+   * 这样既能分块让出主线程，又不用把整段拼成一个大二进制串（省一次内存峰值）。
+   */
+  const pending = [];
+  let draining = false;
+  const ENCODE_CHUNK = 49152;
+  const STR_CHUNK = 0x8000;
+
+  function drainQueue() {
+    if (draining) return;
+    const item = pending.shift();
+    if (!item) return;
+    draining = true;
+    const bytes = item.view;
+    let out = '';
+    let at = 0;
+    const step = () => {
+      try {
+        const end = Math.min(bytes.length, at + ENCODE_CHUNK);
+        let s = '';
+        for (let i = at; i < end; i += STR_CHUNK) {
+          s += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(end, i + STR_CHUNK)));
+        }
+        out += btoa(s);
+        at = end;
+      } catch {
+        // 编码失败就当这一段没抓到 —— 绝不能因为抓流给页面抛异常
+        draining = false;
+        if (pending.length) setTimeout(drainQueue, 0);
+        return;
+      }
+      if (at < bytes.length) {
+        // 让出主线程：播放器/页面的其它活儿有机会跑
+        setTimeout(step, 0);
+        return;
+      }
+      draining = false;
+      try {
+        post({
+          kind: 'buffer',
+          mime: item.mime,
+          sbId: item.sbId,
+          mode: item.mode,
+          size: item.size,
+          base64: out,
+        });
+      } catch { /* 发不出去就算了 */ }
+      if (pending.length) setTimeout(drainQueue, 0);
+    };
+    step();
+  }
+
   try {
     const origAppend = SourceBuffer.prototype.appendBuffer;
     SourceBuffer.prototype.appendBuffer = function patchedAppendBuffer(data, ...rest) {
-      // 先把字节拷成 base64 再往下走：appendBuffer 之后页面可能转移或复用这块内存
+      // 只拷字节（appendBuffer 之后页面可能转移或复用这块内存，所以必须**先**拷），
+      // 编码放到队列里去做 —— 见上面那段注释：同步编码会把页面堵死。
       try {
         const view = describe(data);
         if (view && view.byteLength) {
-          post({
-            kind: 'buffer',
+          pending.push({
+            view: new Uint8Array(view), // 真拷贝（构造函数传 typed array 是复制）
             mime: this.__vhMime || '',
             // 没有 mime 时，这条编号就是"这是哪条流"的唯一线索
             sbId: idFor(this),
             mode: this.mode || '',
             size: view.byteLength,
-            base64: toBase64(view),
           });
+          drainQueue();
         }
-      } catch { /* 拷贝或编码失败就放过，页面照常播放 */ }
+      } catch { /* 拷贝失败就放过，页面照常播放 */ }
       return origAppend.call(this, data, ...rest);
     };
   } catch { /* 钩不上也不该让页面出错 */ }

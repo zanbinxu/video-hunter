@@ -166,15 +166,23 @@ export function groupBuffers(items) {
     // 有 mime 就按 mime 分（播放器重建 SourceBuffer 时还是同一条轨，要合在一起）；
     // 没 mime 只能按编号分（那是几条不同的流）。
     const key = mime || `sb:${item.sbId || '未知'}`;
+    // 再按**容器**分一层：播放器可以在同一条 SourceBuffer 上 `changeType()` 换容器，
+    // 于是同一个 mime 下混着两种格式（用户实测：视频流里 webm 6MB + fmp4 63MB）。
+    // 不分层的话，解析器只认第一种，换容器之后的整段都解析不出来、被整段丢掉。
+    // kind 缺省（老的调用方、单元测试）时行为与以前完全一致。
+    const kind = item.kind && item.kind !== 'unknown' ? item.kind : '';
+    const groupKey = kind ? `${key}|${kind}` : key;
 
     // 判重也按分组来：同一条流的重复分片要去掉，
     // 但两条不同的流里"碰巧一样"的分片不能互相顶掉。
-    const fingerprintKey = `${key}#${fingerprint(item.bytes)}`;
+    const fingerprintKey = `${groupKey}#${fingerprint(item.bytes)}`;
     if (seen.has(fingerprintKey)) { duplicates += 1; continue; }
     seen.add(fingerprintKey);
 
-    if (!map.has(key)) map.set(key, { mime, sbId: item.sbId || '', chunks: [], bytes: 0 });
-    const g = map.get(key);
+    if (!map.has(groupKey)) {
+      map.set(groupKey, { mime, sbId: item.sbId || '', kind, chunks: [], bytes: 0 });
+    }
+    const g = map.get(groupKey);
     g.chunks.push(item.bytes);
     g.bytes += item.bytes.byteLength;
   }

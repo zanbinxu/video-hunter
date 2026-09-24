@@ -321,6 +321,9 @@ function mseStart(msg = {}) {
     // 每条流（分组键 → video/audio）先前分析出来的大类：给"只有分片"的那一组
     // 认领初始化段时用（见 assembleMseCapture 里的注释）
     seenStreamType: new Map(),
+    // 每条流最近一次识别出来的**容器**（webm / fmp4 / mpegts）：用来给"分片从中间续上"
+    // 的那一段定身份（见 mseBuffer 里的注释）
+    streamKind: new Map(),
     // 每条流**实际收到的容器**各自多少字节：`${分组键}|${容器}` → 字节数。
     //
     // 为什么要它：播放器可以在**同一条 SourceBuffer 上 `changeType()`**，把这条流
@@ -716,11 +719,18 @@ function mseBuffer(msg) {
   // 分组键用的是 mime/编号，而播放器能在同一条 SourceBuffer 上换容器 ——
   // 所以"键相同、容器不同"这件事必须在这一层才能看见（见 containerBytes 的注释）。
   const key = msg.mime || `sb:${msg.sbId || ''}`;
-  const kind = sniffContainer(bytes);
+  const sniffedRaw = sniffContainer(bytes);
+  // `webm-no-init` 只是"这一段的头没抓到"、**同一个容器**；`unknown` 是"分片被切成两段、
+  // 这段从中间续上"的正常情况。两者都不能算换容器，否则同一个 SourceBuffer 的
+  // init 和分片会被拆成两组、甚至被丢掉。
+  const sniffed = sniffedRaw === 'webm-no-init' ? 'webm' : sniffedRaw;
+  const lastKind = mse.streamKind.get(key) || '';
+  const kind = sniffed === 'unknown' ? (lastKind || 'unknown') : sniffed;
+  if (sniffed !== 'unknown') mse.streamKind.set(key, sniffed);
   const tallyKey = `${key}|${kind}`;
   mse.containerBytes.set(tallyKey, (mse.containerBytes.get(tallyKey) || 0) + bytes.byteLength);
 
-  mse.items.push({ seq: Number(msg.seq) || 0, mime: msg.mime || '', sbId: msg.sbId || '', bytes });
+  mse.items.push({ seq: Number(msg.seq) || 0, mime: msg.mime || '', sbId: msg.sbId || '', bytes, kind });
   mse.bytes += bytes.byteLength;
   trackMediaTime(mse, msg.mime, msg.sbId, bytes);
   return { ok: true, chunks: mse.items.length, bytes: mse.bytes };
@@ -1070,6 +1080,27 @@ async function finishAssembly(s, ctx) {
     }
     webmVideoTracks.push(...demuxed.tracks.filter((t) => t.type === 'video'));
     webmAudioTracks.push(...demuxed.tracks.filter((t) => t.type === 'audio'));
+  }
+
+  // 画面这条流中途换了容器时，两种候选会同时存在（fMP4 一组 + WebM 一组）：
+  // 它们是**两种编码**，拼不成一条轨，只能保留内容更多的那一段 —— 但必须说出来，
+  // 不能像以前那样静默丢掉一部分（用户实测：视频流 webm 6MB + fmp4 63MB，丢了那 63MB）。
+  if (video && webmVideoTracks.length) {
+    const fmp4Bytes = video.fragments?.byteLength || 0;
+    const webmBytes = webmVideoTracks.reduce((sum, t) => sum + (t.frames || [])
+      .reduce((s, f) => s + (f.data?.byteLength || 0), 0), 0);
+    const mb = (n) => `${Math.round(n / 1048576)}MB`;
+    // 只有"WebM 更长 **且** 有 WebM 音轨可配（或本来就没音轨）"时才改走 WebM 那条路 ——
+    // 否则会把 fMP4 的音轨一起丢掉（WebM 封装装不了 AAC）。
+    const useWebm = webmBytes > fmp4Bytes && (webmAudioTracks.length > 0 || !audio);
+    if (useWebm) {
+      warnings.push(`画面这条流中途换了容器（fMP4 ${mb(fmp4Bytes)} → WebM ${mb(webmBytes)}）：`
+        + '两种编码拼不成一条轨，这一份只保留了更长的 WebM 那一段');
+      video = null;
+    } else {
+      warnings.push(`画面这条流中途换了容器（WebM ${mb(webmBytes)} → fMP4 ${mb(fmp4Bytes)}）：`
+        + '两种编码拼不成一条轨，这一份只保留了更长的 fMP4 那一段（另一段在管理页里没有单独存）');
+    }
   }
 
   // ---- 画面是 WebM 的流：出 .webm，**零转码** ----
