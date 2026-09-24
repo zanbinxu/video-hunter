@@ -97,15 +97,60 @@
    * 这样既能分块让出主线程，又不用把整段拼成一个大二进制串（省一次内存峰值）。
    */
   const pending = [];
-  let draining = false;
-  const ENCODE_CHUNK = 49152;
+  let inFlight = false;
+  let encoderWorker = null;
+  let workerBroken = false;
+  const ENCODE_CHUNK = 49152; // 3 的倍数：分块 btoa 再拼接 == 整体 btoa
   const STR_CHUNK = 0x8000;
 
-  function drainQueue() {
-    if (draining) return;
-    const item = pending.shift();
-    if (!item) return;
-    draining = true;
+  /**
+   * 把字节编码成 base64 的 Worker。
+   *
+   * 为什么还要 Worker：只做"分块 + 让出主线程"还不够 —— 刷新后的第一次抓流，
+   * 播放器**重新缓冲**会一瞬间 append 进来几十 MB，只要编码还跑在页面主线程上，
+   * 哪怕分成小块，播放器的画面管线也会被饿着（用户实测：一直在转圈）。
+   * 搬到 Worker 之后，主线程只做一次拷贝 + 收一个字符串，编码那一大坨 CPU 不再占它。
+   *
+   * 页面 CSP 可能不允许 blob: worker → 那时自动退回主线程分块编码（功能不变，只是慢）。
+   */
+  const WORKER_SRC = 'self.onmessage=function(e){var b=new Uint8Array(e.data),s="",i;'
+    + 'try{for(i=0;i<b.length;i+=0x8000){s+=String.fromCharCode.apply(null,b.subarray(i,Math.min(b.length,i+0x8000)));}'
+    + 's=btoa(s);}catch(x){s="";}self.postMessage(s);};';
+
+  function ensureWorker() {
+    if (encoderWorker || workerBroken) return encoderWorker;
+    try {
+      const url = URL.createObjectURL(new Blob([WORKER_SRC], { type: 'text/javascript' }));
+      const w = new Worker(url);
+      // 出错就永久退回主线程那条路（不要每条都重试、也不给页面抛异常）
+      w.onerror = () => { workerBroken = true; encoderWorker = null; };
+      URL.revokeObjectURL(url);
+      encoderWorker = w;
+    } catch {
+      workerBroken = true;
+    }
+    return encoderWorker;
+  }
+
+  /** 发出去（消息格式与之前完全一致）并接着处理下一条 —— 顺序严格 FIFO */
+  function deliver(item, base64) {
+    try {
+      if (base64) {
+        post({
+          kind: 'buffer',
+          mime: item.mime,
+          sbId: item.sbId,
+          mode: item.mode,
+          size: item.size,
+          base64,
+        });
+      }
+    } catch { /* 发不出去就算了 */ }
+    if (pending.length) setTimeout(pump, 0);
+  }
+
+  /** 退路：主线程分块编码（每 48 KB 让出一次，别把页面堵住） */
+  function encodeOnMainThread(item) {
     const bytes = item.view;
     let out = '';
     let at = 0;
@@ -119,30 +164,35 @@
         out += btoa(s);
         at = end;
       } catch {
-        // 编码失败就当这一段没抓到 —— 绝不能因为抓流给页面抛异常
-        draining = false;
-        if (pending.length) setTimeout(drainQueue, 0);
+        deliver(item, ''); // 编码失败就当这一段没抓到 —— 绝不能给页面抛异常
         return;
       }
-      if (at < bytes.length) {
-        // 让出主线程：播放器/页面的其它活儿有机会跑
-        setTimeout(step, 0);
-        return;
-      }
-      draining = false;
-      try {
-        post({
-          kind: 'buffer',
-          mime: item.mime,
-          sbId: item.sbId,
-          mode: item.mode,
-          size: item.size,
-          base64: out,
-        });
-      } catch { /* 发不出去就算了 */ }
-      if (pending.length) setTimeout(drainQueue, 0);
+      if (at < bytes.length) { setTimeout(step, 0); return; }
+      deliver(item, out);
     };
     step();
+  }
+
+  function pump() {
+    if (inFlight) return;
+    const item = pending.shift();
+    if (!item) return;
+    const w = ensureWorker();
+    if (!w) { encodeOnMainThread(item); return; }
+    inFlight = true;
+    w.onmessage = (e) => {
+      inFlight = false;
+      deliver(item, typeof e.data === 'string' ? e.data : '');
+    };
+    try {
+      // 传**副本**（structured clone）：转移 buffer 会把它 detach，
+      // 万一 Worker 那边出岔子，这一段就再也救不回来了 —— 一次拷贝换确定性，值。
+      w.postMessage(item.view);
+    } catch {
+      inFlight = false;
+      workerBroken = true;
+      encodeOnMainThread(item);
+    }
   }
 
   try {
@@ -161,7 +211,7 @@
             mode: this.mode || '',
             size: view.byteLength,
           });
-          drainQueue();
+          pump();
         }
       } catch { /* 拷贝失败就放过，页面照常播放 */ }
       return origAppend.call(this, data, ...rest);
