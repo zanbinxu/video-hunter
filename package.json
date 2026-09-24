@@ -21,6 +21,7 @@
     "test": "node --test --test-isolation=none \"test/*.test.mjs\"",
     "verify": "node tools/check-syntax.mjs && node --test --test-isolation=none \"test/*.test.mjs\"",
     "repro": "node --test --test-isolation=none \"test/repro/*.test.mjs\"",
+    "check-product": "node tools/product-check.mjs",
     "browser-check": "node tools/browser-check.mjs --port 9333 --e2e http://127.0.0.1:8791",
     "browser-check:extras": "node tools/browser-check.mjs --port 9333 --extras http://127.0.0.1:8791",
     "browser-check:all": "node tools/browser-check.mjs --port 9333 --e2e http://127.0.0.1:8791 --extras http://127.0.0.1:8791",
