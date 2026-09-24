@@ -80,10 +80,10 @@ function audioLevels(file, startSeconds = 0) {
   const out = tmpFile('raw');
   const seek = Math.max(0, startSeconds + 0.5);
   try {
-    execFileSync('ffmpeg', [
+    const res = execFileSync('ffmpeg', [
       '-v', 'error', '-ss', String(seek), '-i', file, '-map', '0:a:0', '-t', '10',
       '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', '48000', '-ac', '1', '-y', out,
-    ], { stdio: ['ignore', 'inherit', 'inherit'] });
+    ], { stdio: ['ignore', 'ignore', 'ignore'] });
     const buf = readFileSync(out);
     const n = Math.floor(buf.length / 2);
     if (!n) return { seconds: 0, rms: 0, peak: 0 };
@@ -146,6 +146,8 @@ function spans(file) {
       holes,
       maxGap: Math.round(maxGap * 100) / 100,
       declared: s.duration && s.duration !== 'N/A' ? Number(s.duration) : null,
+      // 同一时间戳上挤了好几帧 = "两段内容交错焊在一起"的形状（换集/重发 init 的典型痕迹）
+      duplicated: pk.length - new Set(pk.map((p) => p.pts.toFixed(3))).size,
     };
   };
 
@@ -181,8 +183,10 @@ function check(file, { decode }) {
       + `${t.first != null ? t.first.toFixed(2) : '?'} → ${t.last != null ? t.last.toFixed(2) : '?'} 秒`
       + `（覆盖 ${span != null ? span.toFixed(2) : '?'} 秒）`
       + `${t.keyframes != null ? `｜${t.keyframes} 个关键帧` : ''}`
+      + `${t.duplicated ? `｜**${t.duplicated} 帧挤在同一时间戳上**` : ''}`
       + `${t.holes ? `｜**${t.holes} 处空洞，最大 ${t.maxGap} 秒**` : ''}`);
     if (t.holes) problems.push(`${label}轨有 ${t.holes} 处空洞`);
+    if (t.duplicated) problems.push(`${label}轨有 ${t.duplicated} 帧时间戳重复`);
   }
 
   if (s.video && s.audio) {
