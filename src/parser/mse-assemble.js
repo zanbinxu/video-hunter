@@ -191,6 +191,29 @@ export function groupBuffers(items) {
 }
 
 /**
+ * 从某个偏移开始，盒子的长度链能不能**一路走到末尾**。
+ *
+ * 为什么需要它：扫描救援（`findTopBox`）在字节错位时可能"找到一个像样的 moof"，
+ * 但那个位置之后的数据未必是连续的 —— 用户实测就是这种：救回来的视频轨
+ * **每一帧都解不开**（"obu_forbidden_bit out of range"），产物看起来成功、画面却是死的。
+ * 这比"整组丢掉"更糟，所以救援必须带一道"链是否完整"的验证：
+ * 链断了就**退回丢掉 + 说明**，绝不产出坏画面。
+ */
+function boxChainOk(bytes, from) {
+  let at = from;
+  let guard = 0;
+  while (at + 8 <= bytes.byteLength) {
+    guard += 1;
+    if (guard > 200000) return false;
+    const size = ((bytes[at] << 24) | (bytes[at + 1] << 16) | (bytes[at + 2] << 8) | bytes[at + 3]) >>> 0;
+    if (size === 1) return false;
+    if (size < 8 || at + size > bytes.byteLength) return false;
+    at += size;
+  }
+  return at >= bytes.byteLength - 7;
+}
+
+/**
  * 兜底用：找顶层某个盒子的**起止偏移**（只看盒子头，不解析内容）。
  *
  * 为什么需要它：严格拆分（`splitSelfContainedFmp4`）会把"能一路解析到最后一个字节"
@@ -355,7 +378,10 @@ export function analyzeGroup(group) {
       // 起当分片 —— 交给下游照常解析（解析不了的部分它自己会按缺样本处理）。
       const moov = findTopBox(merged, 'moov');
       const moof = findTopBox(merged, 'moof');
-      if (moov && moof && moof.start >= moov.end) {
+      // ⚠️ 救援必须带验证（`boxChainOk`）：扫描出来的位置之后，盒子长度链得能一路走到末尾。
+      // 链断 = 那里并不是真正的连续数据 —— 硬当分片用会产出"每帧都解不开"的坏轨
+      // （用户实测：产物看着成功、画面却是死的）。宁可退回"丢掉 + 说明"。
+      if (moov && moof && moof.start >= moov.end && boxChainOk(merged, moof.start)) {
         return {
           container,
           contentType: fromMime,
@@ -383,7 +409,7 @@ export function analyzeGroup(group) {
   // 能救就按 fMP4 交出去，救不了再如实说"认不出容器"。
   const rescueMoov = findTopBox(merged, 'moov');
   const rescueMoof = findTopBox(merged, 'moof');
-  if (rescueMoov && rescueMoof && rescueMoof.start >= rescueMoov.end) {
+  if (rescueMoov && rescueMoof && rescueMoof.start >= rescueMoov.end && boxChainOk(merged, rescueMoof.start)) {
     return {
       container: 'fmp4',
       contentType: fromMime,

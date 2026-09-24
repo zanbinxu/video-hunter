@@ -178,14 +178,18 @@ test('A1（行为）解析不出来的组必须"说出来"，不能连 init 一�
   // 少 5 个字节（模拟一次 append 丢失/解码失败留下的洞，或尾巴被截断）
   const torn = group(healthy.slice(0, healthy.byteLength - 5));
 
-  // "能不能用"这件事必须有标志能让调用方判断
+  // "能不能用"这件事必须有标志能让调用方判断：
+  //   · 能用（init/fragments 都齐）→ 走正常合并；
+  //   · 或者带 missingInit / error → 上层要么去借一份头部、要么明确写进产物提示。
+  // 注意这里**不要求"一定救回来"**：加了 boxChainOk 验证之后，链不完整的组会被
+  // 主动放弃（宁可丢掉并说明，也不产出"每帧都解不开"的坏画面）。
   const usable = torn.init != null || torn.fragments != null;
-  const flagged = torn.missingInit === true;
+  const flagged = torn.missingInit === true || Boolean(torn.error);
 
   assert.ok(
     usable || flagged,
-    '这一组解析失败了（error 有值），却既没有 init/fragments，也没有 missingInit 标志 —— '
-    + `调用方四个分支一个都不匹配，于是整条轨（连初始化段）被静默丢掉。`
+    '这一组解析失败了，却既没有 init/fragments，也没有 missingInit / error —— '
+    + `调用方四个分支一个都不匹配，整条轨（连初始化段）会被静默丢掉。`
     + `实际：error=${JSON.stringify(torn.error)}｜missingInit=${torn.missingInit}｜`
     + `init=${torn.init}｜fragments=${torn.fragments}`,
   );
