@@ -155,6 +155,102 @@ function* walk(bytes, start, end) {
   }
 }
 
+/**
+ * 遇到"播放器又发了一份 init"时，跳到**下一个 Cluster**。
+ *
+ * ## 为什么必须专门处理（用户 2026-09-24 报的那个）
+ *
+ * 抓流钩的是 `appendBuffer`，而 MSE 允许播放器在**同一条** SourceBuffer 里
+ * 重新初始化：`changeType()`、拖进度条重新预取、码率自适应都会再 append 一份
+ * init 进去。于是抓到的字节流会变成 `init + clusters + init + clusters`。
+ *
+ * 第二份 init 里那个 `Segment` 元素声明的是**它原来那个文件的长度**（几百 KB 到几 MB），
+ * 照着这个长度往下跳，后面真实抓到的 Cluster 就被**整段吞掉**了 —— 这正是
+ * "产物里画面只有开头 23 秒、后面十二分钟只剩音频"的成因（缓冲里明明有 302 MB，
+ * 写出来的文件只有 32 MB）。
+ *
+ * 判据是规范级的，不靠猜：**Segment 不允许嵌 Segment**，EBML Header 也不允许出现在
+ * Segment 里。所以在这一层看到它们，只有一个解释：这里又来了一份 init。
+ *
+ * 处理：**不认那份 init 声明的长度**，改看它自己的子元素（Tracks / SeekHead / Info…），
+ * 逐个跳过，直到遇到真正的 Cluster —— 那才是要继续读的数据。
+ *
+ * @returns {number|null} 下一个 Cluster 的偏移；认不出来返回 null（调用方必须如实上报）
+ */
+function skipReinitialization(bytes, head, end) {
+  // EBML Header：自己是完整元素（长度是真的），跳过它即可 —— 紧随其后的那半份
+  // Segment 由下一轮循环识别
+  if (head.id === EBML_ID.EBML) {
+    if (head.unknownSize) return null;
+    const after = head.payloadStart + head.size;
+    return after > head.payloadStart && after <= end ? after : null;
+  }
+  // Segment：**不看它声明的长度**，只看它的子元素，直到遇到 Cluster
+  let pos = head.payloadStart;
+  for (let guard = 0; guard < 512 && pos + 2 <= end; guard += 1) {
+    const child = readHeader(bytes, pos);
+    if (!child) return null;
+    if (child.id === EBML_ID.Cluster) return pos;
+    if (child.unknownSize) return null;
+    const childEnd = child.payloadStart + child.size;
+    if (childEnd <= child.payloadStart || childEnd > end) return null;
+    pos = childEnd;
+  }
+  return null;
+}
+
+/**
+ * 走 Segment 的内容，并处理两种"按声明长度走会丢数据"的情形：
+ *
+ *  1. **中途又发了一份 init**（见 `skipReinitialization`）：认出它、跳过它自己的
+ *     子元素，在下一个 Cluster 处继续读；
+ *  2. **Segment 声明的长度比实际字节短**（借来的头部、或者重发 init 之后继续 append）：
+ *     声明范围走完之后，只要后面确实还是 Cluster / init，就接着读，并**报出来**。
+ *
+ * 而且读不动时不再静默收场 —— 通过 `onNote` 把"还剩多少字节没读"交给上层去说。
+ * 这个函数只做"多认出来一些数据"，不会跳过任何 Cluster：新结果一定是旧结果的超集。
+ *
+ * @param {function} onNote 记录每一处跳过/放弃：{at, bytes, reinit?, short?, broken?}
+ */
+function* walkSegmentContent(bytes, start, declaredEnd, end, onNote) {
+  let pos = start;
+  let limit = Math.min(declaredEnd, end);
+  const extended = limit >= end;
+  for (let guard = 0; guard < 1e6 && pos + 2 <= limit; guard += 1) {
+    const head = readHeader(bytes, pos);
+    if (!head) {
+      onNote({ at: pos, bytes: limit - pos, broken: true });
+      return;
+    }
+    if (head.id === EBML_ID.EBML || head.id === EBML_ID.Segment) {
+      const next = skipReinitialization(bytes, head, limit);
+      // EBML Header 那一半不单独报（它和紧随其后的 Segment 是同一次重新初始化）
+      if (head.id === EBML_ID.Segment) {
+        onNote({ at: pos, bytes: (next ?? limit) - pos, reinit: true, broken: next == null });
+      }
+      if (next == null) return;
+      pos = next;
+      continue;
+    }
+    const payloadEnd = head.unknownSize ? limit : Math.min(limit, head.payloadStart + head.size);
+    if (payloadEnd < head.payloadStart) return;
+    yield { ...head, payloadEnd };
+    if (head.unknownSize) return;
+    pos = payloadEnd;
+  }
+  // 声明范围走完了，缓冲里却还有数据：只有确实还是 Cluster / init 才继续，
+  // 否则就当"到这里为止"（保持原来的行为，不乱读）
+  if (pos + 2 <= end && !extended) {
+    const peek = readHeader(bytes, pos);
+    const looksLikeData = peek
+      && (peek.id === EBML_ID.Cluster || peek.id === EBML_ID.EBML || peek.id === EBML_ID.Segment);
+    if (looksLikeData) {
+      onNote({ at: pos, bytes: end - pos, short: true });
+      yield* walkSegmentContent(bytes, pos, end, end, onNote);
+    }
+  }
+}
+
 /** 无符号整数元素（EBML 里整数是**大端、定长**，不是变长） */
 function readUint(bytes, el) {
   let value = 0;
@@ -451,7 +547,11 @@ export function demuxWebm(bytes) {
   let skippedBlocks = 0;
   let clusters = 0;
 
-  for (const cluster of walk(bytes, segment.payloadStart, segment.payloadEnd)) {
+  // 走 Segment 的内容：中途重发的 init / 声明长度不足，都在这里面处理并记下来
+  const demuxNotes = [];
+  for (const cluster of walkSegmentContent(
+    bytes, segment.payloadStart, segment.payloadEnd, bytes.byteLength, (n) => demuxNotes.push(n),
+  )) {
     if (cluster.id !== EBML_ID.Cluster) continue;
     clusters += 1;
     const timeEl = findChild(bytes, cluster.payloadStart, cluster.payloadEnd, EBML_ID.Timestamp);
@@ -494,6 +594,26 @@ export function demuxWebm(bytes) {
     }
   }
 
+  // ---- 把"跳过 / 少读"如实说出来 ----
+  //
+  // 这三件事以前全是静默的，而静默正是这个 bug 难查的原因：
+  // 产物短了一大截，界面上却写着"成功"，用户只能自己发现"后半段没画面"。
+  const reinits = demuxNotes.filter((n) => n.reinit && !n.broken);
+  const shorts = demuxNotes.filter((n) => n.short);
+  const broken = demuxNotes.find((n) => n.broken);
+  if (reinits.length && warnings.length < 5) {
+    warnings.push(`播放器中途又发了一份初始化段（${reinits.length} 处）：`
+      + '已经跳过它、接着读后面的内容（这是换码率/拖进度时播放器的正常动作）');
+  }
+  if (shorts.length && !reinits.length && warnings.length < 5) {
+    warnings.push(`Segment 声明的长度比实际数据短（${shorts.length} 处）：已按实际字节继续读，`
+      + '末尾那一段可能不完整');
+  }
+  if (broken && warnings.length < 5) {
+    warnings.push(`读到第 ${clusters} 个 Cluster 之后读不动了（还剩 ${broken.bytes} 字节没读）：`
+      + '这一段后面的内容没有进产物，这一份可能少了一截');
+  }
+
   // 时长用**下一帧的时间戳**推：WebM 大多不写 DefaultDuration，
   // 而帧与帧的时间差是现成的、也是播放器实际用的那个值。
   for (const track of info.tracks) {
@@ -506,7 +626,16 @@ export function demuxWebm(bytes) {
     }
   }
 
-  return { timestampScaleNs: info.timestampScaleNs, tracks: info.tracks, clusters, skippedBlocks, warnings };
+  return {
+    timestampScaleNs: info.timestampScaleNs,
+    tracks: info.tracks,
+    clusters,
+    skippedBlocks,
+    warnings,
+    // 中途重发 init 的处数、以及"读不动了"剩下的字节数 —— 给上层做诊断/提示用
+    reinitCount: reinits.length,
+    unparsedBytes: broken ? broken.bytes : 0,
+  };
 }
 
 /** 给 UI / 日志用的一句话描述 */

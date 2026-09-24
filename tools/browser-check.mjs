@@ -3221,6 +3221,108 @@ async function runExtensionExtras(cdp, extId, origin) {
     problems += 1;
   }
 
+  /* ---- 8f-2. 播放器在**同一个 SourceBuffer 里又发了一次 init** ----
+   *
+   * 用户 2026-09-24 报的（真实产物：定档 4K、**没换过清晰度**，产物里画面只有
+   * 开头 23.2 秒，后面十二分钟只剩音频；而 banner 上写着缓冲已攒到 302 MB，
+   * 写出来的文件只有 32 MB）。根因不是"格式不支持"：
+   * MSE 允许播放器**在原地重新初始化同一条 SourceBuffer**（`changeType` /
+   * 拖进度重新预取都会这么干），于是这条流变成 `init + clusters + init + clusters`，
+   * 而 `webm-demux` 的 `walk()` 读到第二份 init 的元素就读不动了 —— 直接 return，
+   * 后面整段丢掉，而且 `skippedBlocks=0`、`warnings=[]`，上层完全看不出异常。
+   *
+   * 判据：**画面必须覆盖整条时间轴**。正常喂法是 150 帧；这里两半拼起来应该约
+   * 300 帧，退回旧行为只剩约 150 帧。
+   */
+  try {
+    const pageUrl = `${origin}/__page/mse-webm-video?reinit=1`;
+    const created = await cdp.send('Target.createTarget', { url: pageUrl });
+    const riTarget = created.result?.targetId;
+    const attached = await cdp.send('Target.attachToTarget', { targetId: riTarget, flatten: true });
+    const riSession = attached.result?.sessionId;
+    await cdp.send('Runtime.enable', {}, riSession);
+    await cdp.send('Page.enable', {}, riSession);
+    await sleep(2500);
+
+    const selfCheck = await evalIn(cdp, riSession, `document.getElementById('status').textContent`);
+    console.log(`  · 中途重发 init 测试页自检：${selfCheck}`);
+    if (!selfCheck.includes('append 完成')) {
+      console.error(`  ✗ 中途重发 init 测试页自己没跑通：${selfCheck}`);
+      problems += 1;
+    }
+
+    const tabId = await evalIn(cdp, control.sessionId, `(async () => {
+      const tabs = await chrome.tabs.query({ url: ${JSON.stringify(pageUrl)} });
+      return tabs.length ? tabs[0].id : null;
+    })()`);
+    const started = JSON.parse(await evalIn(cdp, control.sessionId, `(async () => {
+      const r = await chrome.runtime.sendMessage({ type: 'vh:mse-start', tabId: ${tabId} });
+      return JSON.stringify(r || {});
+    })()`, { timeout: 30000 }));
+
+    if (!started.ok) {
+      console.error(`  ✗ 中途重发 init 用例里抓流启动失败：${started.error}`);
+      problems += 1;
+    } else {
+      await evalIn(cdp, control.sessionId, `chrome.tabs.reload(${tabId}).then(() => 'ok')`);
+      await sleep(9000);
+      const stopped = JSON.parse(await evalIn(cdp, control.sessionId, `(async () => {
+        const r = await chrome.runtime.sendMessage({ type: 'vh:mse-stop' });
+        return JSON.stringify(r || {});
+      })()`, { timeout: 120000 }));
+
+      if (!stopped.ok) {
+        console.error(`  ✗ 中途重发 init 用例没能产出文件：${String(stopped.error).split('\\n')[0]}`);
+        problems += 1;
+      } else {
+        for (const w of stopped.warnings || []) console.log(`    ! ${String(w).split('\\n')[0]}`);
+        // 收到的数据本身也要摊开：这一条以前看不出来"到底是没收全还是拆包丢了"
+        const groups = stopped.detail?.groups || [];
+        console.log(`    · 这次收到的：${stopped.detail?.chunks ?? '?'} 段｜分组 ${groups.length} 个｜`
+          + groups.map((g) => `${g.contentType || g.mime || '?'}(init ${g.init}/片段 ${g.fragments})`).join(' + '));
+        const dump = JSON.parse(await evalIn(cdp, control.sessionId, `(async () => {
+          const root = await navigator.storage.getDirectory();
+          const fh = await root.getFileHandle(${JSON.stringify(stopped.fileName)});
+          const file = await fh.getFile();
+          const buf = new Uint8Array(await file.arrayBuffer());
+          let bin = '';
+          const CH = 0x8000;
+          for (let i = 0; i < buf.length; i += CH) bin += String.fromCharCode.apply(null, buf.subarray(i, i + CH));
+          return JSON.stringify({ bytes: buf.length, base64: btoa(bin) });
+        })()`, { timeout: 120000 }));
+
+        mkdirSync(join(ROOT, '.tmp'), { recursive: true });
+        const file = join(ROOT, '.tmp', 'browser-mse-webm-reinit.webm');
+        writeFileSync(file, Buffer.from(dump.base64, 'base64'));
+        const info = probe(file);
+        const v = (info.streams || []).find((s) => s.codec_type === 'video');
+        const a = (info.streams || []).find((s) => s.codec_type === 'audio');
+        let frames = 0;
+        try { frames = countDecodedVideoFrames(file); } catch { frames = 0; }
+        console.log(`  · 中途重发 init：产物 ${stopped.fileName}｜${stopped.size} 字节`
+          + `｜${v ? `vp9 ${v.width}x${v.height}` : '无画面轨'}｜${a ? a.codec_name : '无音频轨'}`
+          + `｜真解出 ${frames} 帧（整段 6 个 Cluster 应该是 150 帧；`
+          + '修复前只会有前半段约 75 帧）');
+        if (!v || !a) {
+          console.error('  ✗ 产物必须同时有画面和声音');
+          problems += 1;
+        }
+        if (frames < 140) {
+          console.error(`  ✗ 画面没有覆盖整条时间轴：只解出 ${frames} 帧`
+            + ' —— 重新 init 之后的内容被静默丢掉了（用户报的"只有开头几十秒有画面"就是这个）');
+          problems += 1;
+        } else {
+          console.log('  ✓ 中途重发 init 之后，画面照样覆盖整条时间轴');
+        }
+      }
+    }
+
+    await cdp.send('Target.closeTarget', { targetId: riTarget });
+  } catch (err) {
+    console.error(`  ✗ 中途重发 init 用例失败：${err.message}`);
+    problems += 1;
+  }
+
   /* ---- 8g. 自动保存已录到的部分：到点会存，而且**只留最新一份** ----
    *
    * 用户提的需求（"这里也可以加一个自动保存已录制的部分勾选按钮"）。
