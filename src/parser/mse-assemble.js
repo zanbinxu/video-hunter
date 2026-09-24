@@ -191,6 +191,27 @@ export function groupBuffers(items) {
 }
 
 /**
+ * 兜底用：找顶层某个盒子的**起止偏移**（只看盒子头，不解析内容）。
+ *
+ * 为什么需要它：严格拆分（`splitSelfContainedFmp4`）会把"能一路解析到最后一个字节"
+ * 当成前提；真实抓流里只要有一段字节缺失/重叠，它就整个抛错 —— 于是一整组
+ * （用户实测 **87 MB 画面**）被当成"认不出容器"丢掉。但其实 init（moov）和媒体分片
+ * 都还在，只是边界对不齐，完全可以救。
+ */
+function findTopBox(bytes, want) {
+  let at = 0;
+  while (at + 8 <= bytes.byteLength) {
+    const size = ((bytes[at] << 24) | (bytes[at + 1] << 16) | (bytes[at + 2] << 8) | bytes[at + 3]) >>> 0;
+    const type = String.fromCharCode(bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]);
+    if (size === 1) return null; // 64 位长度（抓流的字节里不会出现）——不猜
+    if (size < 8 || at + size > bytes.byteLength) return null;
+    if (type === want) return { start: at, end: at + size };
+    at += size;
+  }
+  return null;
+}
+
+/**
  * 给"只有分片、没有初始化段"的那一组挑一个能用的初始化段。
  *
  * 判据的优先级：
@@ -314,6 +335,23 @@ export function analyzeGroup(group) {
       // 初始化段可能单独落在自己那一组里，上层要能记住它（见 offscreen 的
       // seenInit），否则后面只补分片的那一组就成了"没有初始化段"。
       const initOnly = /只有初始化段/.test(err.message);
+      // ---- 尽量救：严格拆不出来，多半只是"边界对不齐"，moov 和 moof 其实都还在 ----
+      // 用户实测：一整组 **87 MB 画面**因为这条抛错被当成"认不出容器"丢掉，
+      // 产物里只剩另一条 5 MB 的画面。这里退一步：moov 之前当 init、第一个 moof
+      // 起当分片 —— 交给下游照常解析（解析不了的部分它自己会按缺样本处理）。
+      const moov = findTopBox(merged, 'moov');
+      const moof = findTopBox(merged, 'moof');
+      if (moov && moof && moof.start >= moov.end) {
+        return {
+          container,
+          contentType: fromMime,
+          init: merged.slice(0, moov.end),
+          fragments: merged.slice(moof.start),
+          bytes: merged.byteLength,
+          salvaged: true,
+          error: err.message,
+        };
+      }
       return {
         container,
         contentType: fromMime,

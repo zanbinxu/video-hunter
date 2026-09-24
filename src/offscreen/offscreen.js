@@ -992,6 +992,13 @@ function assembleMseCapture(s) {
         reuseNotes.push(`有一组只有分片、没有初始化段，而本次会话里也没有可以借的 —— `
           + `这一组 ${a.raw.byteLength} 字节没有进产物（解决办法：点抓流之后刷新页面从头来）`);
       }
+    } else {
+      // ⚠️ 以前这里**什么都没有**：认不出的组就静默消失了。用户实测过 87MB 画面
+      // 就这么没的，而提示卡上一句话都没有 —— 因为分支链一个都不匹配，等于无声无息。
+      // 诊断信息：带上容器、大类、体积和具体错误，下次一眼能看出是哪一组、为什么。
+      const why = a.error ? `：${a.error}` : '（既没有 init+分片，也没有 missingInit 标志）';
+      reuseNotes.push(`有一组没能用上（${a.container}/${a.contentType || a.mime || '?'}`
+        + `，${Math.round(a.bytes / 1048576)}MB）${why} —— 这一组没有进产物`);
     }
     // 认不出容器的组直接跳过；一条都认不出时下面会给出明确错误
   }
