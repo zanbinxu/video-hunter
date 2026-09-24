@@ -13,7 +13,7 @@ import { readFileSync, statSync } from 'node:fs';
 import { parseMpd, selectRepresentations } from '../src/parser/dash.js';
 import {
   mergeFmp4, parseInitSegment, extractSegmentSamples, describeMergeInput,
-  parseAudioSpecificConfig, normalizeTrackSamples,
+  parseAudioSpecificConfig, normalizeTrackSamples, truncateAtTimelineRestart,
 } from '../src/parser/mp4-merge.js';
 import { createTsRemuxer } from '../src/parser/remuxer.js';
 import { splitSelfContainedFmp4 } from '../src/parser/fmp4-file.js';
@@ -708,4 +708,51 @@ test('同页换集：第二集与第一集重叠的样本被丢掉，超出末�
   const shorter = normalizeTrackSamples([...ep(4), ...ep(2)]);
   assert.deepEqual(shorter.samples.map((s) => s.dts), [0, 100, 200, 300]);
   assert.equal(shorter.dropped, 2);
+});
+
+/* ------------------------------------------------------------------ *
+ * 换集：时间轴重启之后的内容**整段不要**（用户要的"最起码给我一个完整的第一集"）
+ * ------------------------------------------------------------------ */
+
+test('换集（时间轴重启）：只保留重启之前那一段，第一集保持完整', () => {
+  const ts = 90000;
+  const run = (fromSec, count, stepSec = 0.5) => Array.from({ length: count }, (_, i) => ({
+    dts: Math.round((fromSec + i * stepSec) * ts),
+    duration: Math.round(stepSec * ts),
+    data: null,
+  }));
+  const ep1 = run(0, 200);        // 0 → 100 秒
+  const ep2 = run(0, 300);        // 又从 0 开始，而且更长（150 秒）
+
+  const r = truncateAtTimelineRestart([...ep1, ...ep2], ts);
+  assert.equal(r.cutCount, ep2.length, '第二集整段都不该进产物');
+  assert.equal(r.samples.length, ep1.length, '第一集必须一个样本不少');
+  assert.ok(r.cutAtSeconds <= 3, `切点应该在开头附近，实际 ${r.cutAtSeconds}`);
+  assert.ok(r.afterSeconds >= 60, `重启之前应该已经录到 60 秒以上，实际 ${r.afterSeconds}`);
+});
+
+test('换集判据的**反面**：正常播放 / 往回拖几秒 / 刚开始就拖回开头，都不切', () => {
+  const ts = 90000;
+  const run = (fromSec, count, stepSec = 0.5) => Array.from({ length: count }, (_, i) => ({
+    dts: Math.round((fromSec + i * stepSec) * ts),
+    duration: Math.round(stepSec * ts),
+    data: null,
+  }));
+
+  // ① 接着播（换清晰度就是这样：时间戳不回头）
+  const cont = truncateAtTimelineRestart([...run(0, 200), ...run(100, 200)], ts);
+  assert.equal(cont.cutCount, 0);
+
+  // ② 往回拖几秒重看（分片乱序/重复）：时间戳回退，但**不是回到开头**
+  const back = truncateAtTimelineRestart([...run(0, 200), ...run(80, 20)], ts);
+  assert.equal(back.cutCount, 0, '往回拖不该被当成换集');
+
+  // ③ 刚开抓就拖回开头重看：时间轴还短，不判
+  const early = truncateAtTimelineRestart([...run(0, 20), ...run(0, 20)], ts);
+  assert.equal(early.cutCount, 0);
+
+  // ④ 量不出来 / 空输入不许炸
+  assert.equal(truncateAtTimelineRestart([], ts).cutCount, 0);
+  assert.equal(truncateAtTimelineRestart(run(0, 200), 0).cutCount, 0);
+  assert.equal(truncateAtTimelineRestart(null, ts).cutCount, 0);
 });

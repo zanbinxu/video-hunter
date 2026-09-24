@@ -950,6 +950,58 @@ export function normalizeTrackSamples(samples) {
   return { samples: kept, dropped, sorted };
 }
 
+/** 已经录了这么久，才谈得上"换集"（时间轴太短时，从头开始的多半是拖回开头重播） */
+const RESTART_MIN_RUN_SECONDS = 60;
+/** 新样本的时间戳落在这个秒数以内，才算"从接近 0 重新开始" */
+const RESTART_NEAR_ZERO_SECONDS = 3;
+
+/**
+ * 把「时间轴重新从头开始」之后的内容切掉 —— **抓流那条路专用**（`cutOnRestart`）。
+ *
+ * 为什么要有它（用户反复报的那个）：**同一个页面、地址栏不变的站点**在换集时不发
+ * `ended` / `emptied` / `loadstart` / 新的 SourceBuffer 这四个信号，第二集的样本会接着
+ * 进缓冲。它和第一集重叠的部分会被判重丢掉（所以开头没了），**但比第一集长的那部分会落在
+ * 第一集末尾之后** —— 产物就成了"第一集 + 第二集的尾巴"。用户的原话：
+ *
+ *   「第一段尾巴和第二段开头混在一块儿了，只要我不停，它就一直是一个视频，
+ *     这不扯淡吗？最起码让我有一个完整的第一段吧。」
+ *
+ * 判据只看**样本自己的时间戳**：到这一步三种容器（fMP4 / WebM / TS）都已经统一成样本了，
+ * 不需要认容器、也不需要读包。按**到达顺序**走（"重启"= 后来的片从接近 0 重新开始）：
+ * 之前已经录到 60 秒以上，而这一片的第一个时间戳落回 3 秒以内 → 判为换集，
+ * **从这里往后的样本全部不要**（第一集保持完整；第二集请重新开一次抓流 —— 这正是用户要的）。
+ *
+ * 代价说清楚：如果你在录制中途把进度条拖回**最开头**重看，后面的新内容也会被切掉
+ * （保住的是拖回之前那一段）。这是有意的取舍：**宁可少收一段，也不要把两集焊在一起**，
+ * 而且会明确写进产物提示，不静默。
+ *
+ * @param {Array} samples 到达顺序的样本（时间是 ticks）
+ * @param {number} timescale 这条轨的时钟刻度
+ */
+export function truncateAtTimelineRestart(samples, timescale) {
+  const list = Array.isArray(samples) ? samples : [];
+  const scale = Number(timescale) > 0 ? Number(timescale) : 0;
+  if (!scale || list.length < 2) {
+    return { samples: list, cutCount: 0, cutAtSeconds: null, afterSeconds: null };
+  }
+  let maxTicks = list[0].dts;
+  for (let i = 1; i < list.length; i += 1) {
+    const dts = list[i].dts;
+    const known = maxTicks / scale;
+    const here = dts / scale;
+    if (known >= RESTART_MIN_RUN_SECONDS && here <= RESTART_NEAR_ZERO_SECONDS) {
+      return {
+        samples: list.slice(0, i),
+        cutCount: list.length - i,
+        cutAtSeconds: here,
+        afterSeconds: known,
+      };
+    }
+    if (dts > maxTicks) maxTicks = dts;
+  }
+  return { samples: list, cutCount: 0, cutAtSeconds: null, afterSeconds: null };
+}
+
 /**
  * tick → 微秒，并把每条轨自己的 DTS 起点归零。
  *
@@ -966,10 +1018,17 @@ export function normalizeTrackSamples(samples) {
  *
  * @returns {{micro:Array, origin:number, gaps:Array, sorted:boolean, dropped:number, clamped:number}}
  */
-function toMicroSeconds(track) {
+function toMicroSeconds(track, options = {}) {
   const { timescale } = track.info;
   // 先整理时间轴：抓流的分片可能是乱序到的（见 normalizeTrackSamples）
-  const normalized = normalizeTrackSamples(track.samples);
+  // 抓流那条路还要多一步：**时间轴重新从头开始**（换集）之后的内容整段不要 ——
+  // 否则第二集比第一集长的部分会落在第一集末尾之后，两集就焊在一起了（见
+  // truncateAtTimelineRestart 的注释）。只在抓流这条路上开（`cutOnRestart`），
+  // 下载/合并那条路的"重启"可能是别的东西，不动它。
+  const restart = options.cutOnRestart
+    ? truncateAtTimelineRestart(track.samples, timescale)
+    : { samples: track.samples, cutCount: 0, cutAtSeconds: null, afterSeconds: null };
+  const normalized = normalizeTrackSamples(restart.samples);
   const samples = normalized.samples;
   const origin = samples.length ? samples[0].dts : 0;
   let clamped = 0;
@@ -1021,6 +1080,8 @@ function toMicroSeconds(track) {
   // `sorted` / `dropped` / `clamped` 交给调用方如实上报（见 reportTimelineFixes）。
   return {
     micro, origin, gaps, sorted: normalized.sorted, dropped: normalized.dropped, clamped,
+    // 「时间轴重启（换集）之后被切掉的那一段」的详情，交给调用方写进产物提示
+    restart,
   };
 }
 
@@ -1097,8 +1158,8 @@ export function mergeFmp4(input = {}, options = {}) {
     audio.info.editMediaTime = Math.round((video.info.editMediaTime / video.info.timescale) * 1e6);
   }
 
-  const videoTrack = video ? toMicroSeconds(video) : null;
-  const audioTrack = audio ? toMicroSeconds(audio) : null;
+  const videoTrack = video ? toMicroSeconds(video, options) : null;
+  const audioTrack = audio ? toMicroSeconds(audio, options) : null;
   const videoMicro = videoTrack ? videoTrack.micro : [];
   const audioMicro = audioTrack ? audioTrack.micro : [];
   if (!videoMicro.length && !audioMicro.length) throw new Error('两路输入都没有样本，没什么可合并的');
@@ -1107,6 +1168,20 @@ export function mergeFmp4(input = {}, options = {}) {
   // "暂停后再点停止并保存，35 MB 全没了"，根因就在这里没做整理。
   reportTimelineFixes('视频轨', videoTrack, options.onWarning);
   reportTimelineFixes('音频轨', audioTrack, options.onWarning);
+
+  // 「时间轴重新从头开始」= 换集：那些内容被整段切掉了，必须**当场说出来**，
+  // 否则用户看到的是"录了 40 分钟，产物只有 20 分钟"，而不知道为什么。
+  if (typeof options.onWarning === 'function') {
+    for (const [label, t] of [['视频轨', videoTrack], ['音频轨', audioTrack]]) {
+      if (!t?.restart?.cutCount) continue;
+      options.onWarning(
+        `${label}的时间轴又从头开始了（录到 ${Number(t.restart.afterSeconds).toFixed(0)} 秒之后，`
+        + `又回到第 ${Number(t.restart.cutAtSeconds).toFixed(1)} 秒）—— `
+        + `那是**新的一段**，它的 ${t.restart.cutCount} 个样本没有进这一份产物：`
+        + '这一段（上一集）保持完整。要抓新的一段，请重新点一次「抓流」。',
+      );
+    }
+  }
 
   // 空洞提示：只有**每条有内容的轨都在同一个位置断了**才是死气；
   // 只有一条轨缺，那多半是源流本身在那一刻没有这段内容，报出来让用户自己判断。

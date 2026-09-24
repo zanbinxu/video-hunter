@@ -1101,6 +1101,11 @@ async function finishAssembly(s, ctx) {
     audio: audio ? { init: audio.init, segments: [audio.fragments] }
       : (transcoded ? { aac: transcoded } : undefined),
   }, {
+    // 抓流这条路要**把"换集"之后的内容整段切掉**：同一个页面、地址栏不变的站点不发
+    // 边界信号，第二集的样本会接着进来 —— 比第一集长的部分会落在第一集末尾之后，
+    // 于是两集焊在一起（用户报的"第一段尾巴和第二段开头混一块儿了"）。判据见
+    // truncateAtTimelineRestart：只看样本自己的时间戳，三种容器通用。
+    cutOnRestart: true,
     onWarning: (w) => {
       warnings.push(String(w));
       console.debug('[vh/mse] 合并提示：', w);
