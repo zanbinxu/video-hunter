@@ -199,14 +199,20 @@ export function groupBuffers(items) {
  * 都还在，只是边界对不齐，完全可以救。
  */
 function findTopBox(bytes, want) {
-  let at = 0;
-  while (at + 8 <= bytes.byteLength) {
+  // ⚠️ 不能"从 0 开始按长度往下跳"：用户实测的组**从头就是错位的** ——
+  // 第 3 个盒子声称 47 亿字节，一跳就出了边界，于是整组被当成"认不出容器"丢掉（62 MB 画面）。
+  // 改成**扫标签 + 校验长度**：只要某处的类型标签对得上、长度又合法，就认它。
+  // 代价是一次线性扫描，只在"严格拆分已经失败"这条错误路径上跑。
+  const t0 = want.charCodeAt(0);
+  const t1 = want.charCodeAt(1);
+  const t2 = want.charCodeAt(2);
+  const t3 = want.charCodeAt(3);
+  for (let at = 0; at + 8 <= bytes.byteLength; at += 1) {
+    if (bytes[at + 4] !== t0 || bytes[at + 5] !== t1 || bytes[at + 6] !== t2 || bytes[at + 7] !== t3) continue;
     const size = ((bytes[at] << 24) | (bytes[at + 1] << 16) | (bytes[at + 2] << 8) | bytes[at + 3]) >>> 0;
-    const type = String.fromCharCode(bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]);
-    if (size === 1) return null; // 64 位长度（抓流的字节里不会出现）——不猜
-    if (size < 8 || at + size > bytes.byteLength) return null;
-    if (type === want) return { start: at, end: at + size };
-    at += size;
+    if (size === 1) continue; // 64 位长度（抓流字节里不会出现）——不猜
+    if (size < 8 || at + size > bytes.byteLength) continue;
+    return { start: at, end: at + size };
   }
   return null;
 }
@@ -296,7 +302,15 @@ export function analyzeGroup(group) {
         };
       } catch (err) {
         return {
-          container: 'webm', contentType: fromMime, bytes: merged.byteLength, raw: merged, error: err.message,
+          container: 'webm',
+          contentType: fromMime,
+          bytes: merged.byteLength,
+          raw: merged,
+          // ⚠️ 标记成"没有初始化段"：这一组的头部要么没抓到、要么本身是坏的（字节错位）。
+          // 标出来之后上层才会走"借一份先前收到的头部"那条路 —— 用户实测：
+          // 不标的话分支链一个都不匹配，整组（这次 5MB）连一句提示都没有就没了。
+          missingInit: true,
+          error: err.message,
         };
       }
     }
@@ -362,6 +376,23 @@ export function analyzeGroup(group) {
         error: err.message,
       };
     }
+  }
+
+  // 也许只是"开头错位"：容器认不出来，但里面确实有 moov + moof。
+  // 用户实测的 62MB 画面组就是这种形状（第 3 个盒子长度是垃圾值）——
+  // 能救就按 fMP4 交出去，救不了再如实说"认不出容器"。
+  const rescueMoov = findTopBox(merged, 'moov');
+  const rescueMoof = findTopBox(merged, 'moof');
+  if (rescueMoov && rescueMoof && rescueMoof.start >= rescueMoov.end) {
+    return {
+      container: 'fmp4',
+      contentType: fromMime,
+      init: merged.slice(0, rescueMoov.end),
+      fragments: merged.slice(rescueMoof.start),
+      bytes: merged.byteLength,
+      salvaged: true,
+      error: '开头认不出容器，但里面有 moov + moof，已按 fMP4 救回来',
+    };
   }
 
   return {
