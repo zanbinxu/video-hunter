@@ -24,7 +24,7 @@ import { sanitizeSegment } from '../core/filename.js';
 import { getSettings, setSettings } from '../core/settings.js';
 import { createMediaIndex } from '../core/media-index.js';
 import { describeStorageUse } from '../core/storage-error.js';
-import { captureFileKind } from '../core/capture-limits.js';
+import { captureFileKind, isAutoSnapshotName } from '../core/capture-limits.js';
 import { inspectSeekability, repairTimelineGaps, readMovieDurationSeconds } from '../parser/seek-check.js';
 
 const $ = (id) => document.getElementById(id);
@@ -334,16 +334,17 @@ async function markExported(name) {
   }
 }
 
-/** 秒 → mm:ss / h:mm:ss。用于列表里的**真实时长**。 */
+/** 秒 → hh:mm:ss。用于列表里的**真实时长**，统一包含两位小时（00:mm:ss / hh:mm:ss）。 */
 function formatDuration(seconds) {
   if (!Number.isFinite(seconds) || seconds <= 0) return null;
   const total = Math.round(seconds);
   const h = Math.floor(total / 3600);
   const m = Math.floor((total % 3600) / 60);
   const s = total % 60;
+  const hh = String(h).padStart(2, '0');
   const mm = String(m).padStart(2, '0');
   const ss = String(s).padStart(2, '0');
-  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+  return `${hh}:${mm}:${ss}`;
 }
 
 /**
@@ -359,7 +360,171 @@ function captureKindText(name, kind) {
   const k = captureFileKind(name);
   if (k === 'autoSnapshot') return '自动保存（每 N 分钟更新，只留最新一份）';
   if (k === 'partial') return '未播完时先存的一份（-部分）';
-  return '完整的一段';
+  const s = String(name || '');
+  if (/-前段\.[a-z0-9]+$/i.test(s)) return '起播缓冲段（前段）';
+  if (/-后段\.[a-z0-9]+$/i.test(s)) return '切换后段';
+  if (/-[0-9]+\.[a-z0-9]+$/i.test(s)) return '分段内容';
+  return '完整核心产物';
+}
+
+function getActiveSnapshotName() {
+  return state.record?.autoSnapshot?.fileName
+    || (typeof state.record?.stats?.autoSnapshot === 'string' ? state.record.stats.autoSnapshot : null)
+    || null;
+}
+
+function getSnapshotDiskInfo(item, record) {
+  if (item && item.size > 0) {
+    return { size: item.size, seconds: item.seconds };
+  }
+  const auto = record?.autoSnapshot;
+  if (auto && auto.size > 0) {
+    return { size: auto.size, seconds: auto.mediaSeconds };
+  }
+  return null;
+}
+
+function formatLiveSnapshotMeta(item, stats, record) {
+  const capSec = stats?.mediaCapturedSeconds ?? null;
+  const spanSec = stats?.mediaSpanSeconds ?? null;
+
+  // 1. 抓取到的视频内容的实际净时长（扣除快进/拖进度条产生的巨大空白）
+  const diskInfo = getSnapshotDiskInfo(item, record);
+  const playerProgress = record?.playerProgress;
+  const playerCurrent = (playerProgress && Number.isFinite(playerProgress.currentTime) && (Date.now() - (playerProgress.updatedAt || 0) < 6000))
+    ? playerProgress.currentTime
+    : null;
+
+  const candidateCap = Number.isFinite(capSec) && capSec > 0
+    ? capSec
+    : (Number.isFinite(spanSec) && spanSec > 0 ? spanSec : (diskInfo?.seconds || null));
+
+  // 严禁将"抓取内容"强行覆盖为播放器的播放进度！
+  // 用户可能从视频中间开始播放/录制（如播放记忆跳转、在插件设置中开启从当前镜头开始播放），
+  // 此时抓流缓冲区内的实际视频内容时长（如 50秒 / 4.7MB）与播放进度（如 14分48秒）是两个完全不同的概念。
+  // "抓取内容"必须实打实地反映当前内存缓冲区中实际抓到的视频时长，并随分片到达实时动态更新。
+  const effectiveCapSec = Number.isFinite(candidateCap) && candidateCap >= 0
+    ? candidateCap
+    : (stats?.bytes ? 0 : 0);
+
+  const capturedText = effectiveCapSec === 0 ? '00:00:00' : formatDuration(effectiveCapSec);
+
+  // 2. 播放器当前物理播放进度与视频总时长
+  const playheadSec = playerCurrent ?? stats?.mediaPlayheadSeconds ?? null;
+  const playheadText = Number.isFinite(playheadSec) && playheadSec >= 0
+    ? formatDuration(playheadSec)
+    : null;
+
+  const totalSec = (playerProgress && Number.isFinite(playerProgress.duration) && playerProgress.duration > 0)
+    ? playerProgress.duration
+    : null;
+  const totalText = totalSec ? formatDuration(totalSec) : null;
+
+  const currentBytes = stats?.bytes || 0;
+
+  const diskText = diskInfo?.size ? formatBytes(diskInfo.size) : null;
+  const diskDuration = formatDuration(diskInfo?.seconds);
+
+  const parts = [];
+
+  // 第一个位置：显示实际抓取到的内容时长（用户最关心的核心指标）
+  if (capturedText) {
+    parts.push(`抓取内容 ${capturedText}`);
+  }
+
+  // 第二个位置：播放进度（精准展示物理播放器位置，并标注视频总时间）
+  if (playheadText) {
+    const playheadStr = totalText
+      ? `播放进度 ${playheadText} (总时间 ${totalText})`
+      : `播放进度 ${playheadText}`;
+    parts.push(playheadStr);
+  }
+
+  // 第三个位置：当前抓流大小
+  parts.push(`当前抓流 ${formatBytes(currentBytes)}`);
+
+  // 第四个位置：磁盘快照状态
+  if (diskText) {
+    parts.push(`已落盘快照：${diskDuration || '00:00:10'} · ${diskText}`);
+  } else {
+    parts.push('首份快照即将写入（满 10 秒）');
+  }
+
+  parts.push('每秒实时刷新');
+
+  return parts.join(' · ');
+}
+
+function updateLiveSnapshotElements() {
+  const metas = document.querySelectorAll('[data-live-snapshot]');
+  if (!metas.length) return;
+  if (state.record?.stage !== RECORD_STAGE.RECORDING) {
+    renderMedia();
+    return;
+  }
+  for (const meta of metas) {
+    const fileName = meta.getAttribute('data-live-snapshot');
+    const item = fileName === '__live__'
+      ? null
+      : (state.media.find((m) => m.name === fileName) || null);
+    meta.textContent = formatLiveSnapshotMeta(item, state.record?.stats, state.record);
+  }
+}
+
+function liveCaptureRow() {
+  const row = document.createElement('div');
+  row.className = 'variant';
+  row.style.cursor = 'default';
+  row.style.borderLeft = '3px solid #ef4444';
+  row.style.background = 'rgba(239, 68, 68, 0.05)';
+
+  const left = document.createElement('div');
+  left.style.minWidth = '0';
+  left.style.flex = '1';
+
+  const name = document.createElement('div');
+  name.className = 'res';
+  name.style.fontSize = '13px';
+  name.style.wordBreak = 'break-all';
+  name.style.overflowWrap = 'anywhere';
+  name.style.lineHeight = '1.4';
+  name.style.marginBottom = '3px';
+
+  const liveTag = document.createElement('span');
+  liveTag.style.display = 'inline-block';
+  liveTag.style.background = 'rgba(239, 68, 68, 0.15)';
+  liveTag.style.color = '#ef4444';
+  liveTag.style.fontSize = '11px';
+  liveTag.style.padding = '1px 6px';
+  liveTag.style.borderRadius = '4px';
+  liveTag.style.marginRight = '8px';
+  liveTag.style.fontWeight = 'bold';
+  liveTag.textContent = '● 正在抓流中（每秒实时刷新）';
+
+  const activeSnap = getActiveSnapshotName();
+  const titleText = activeSnap
+    ? activeSnap
+    : (state.record?.title ? `vh-mse-${state.record.title}-正在抓取…` : '正在抓取的视频流（实时缓冲）');
+  name.append(liveTag, document.createTextNode(titleText));
+
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+  meta.setAttribute('data-live-snapshot', '__live__');
+  meta.style.color = '#e2e8f0';
+  meta.textContent = formatLiveSnapshotMeta(null, state.record?.stats, state.record);
+
+  left.append(name, meta);
+
+  const saveBtn = document.createElement('button');
+  saveBtn.className = 'btn primary';
+  saveBtn.textContent = '保存当前最新';
+  saveBtn.title = '把当前这一秒已抓取到的全部内容打包保存到磁盘';
+  saveBtn.addEventListener('click', async () => {
+    await snapshotCapture();
+  });
+
+  row.append(left, saveBtn);
+  return row;
 }
 
 function mediaRow(item) {
@@ -374,36 +539,75 @@ function mediaRow(item) {
   const name = document.createElement('div');
   name.className = 'res';
   name.style.fontSize = '13px';
-  name.style.overflow = 'hidden';
-  name.style.textOverflow = 'ellipsis';
-  name.style.whiteSpace = 'nowrap';
+  name.style.wordBreak = 'break-all';
+  name.style.overflowWrap = 'anywhere';
+  name.style.lineHeight = '1.4';
+  name.style.marginBottom = '3px';
   name.textContent = item.name;
+
+  const activeSnapName = getActiveSnapshotName();
+  const isCurrentLiveSnapshot = state.record?.stage === RECORD_STAGE.RECORDING
+    && state.record?.mode === 'mse'
+    && isAutoSnapshotName(item.name)
+    && Boolean(activeSnapName && activeSnapName === item.name);
+
+  if (isCurrentLiveSnapshot) {
+    row.style.borderLeft = '3px solid #ef4444';
+    row.style.background = 'rgba(239, 68, 68, 0.05)';
+
+    const liveTag = document.createElement('span');
+    liveTag.style.display = 'inline-block';
+    liveTag.style.background = 'rgba(239, 68, 68, 0.15)';
+    liveTag.style.color = '#ef4444';
+    liveTag.style.fontSize = '11px';
+    liveTag.style.padding = '1px 6px';
+    liveTag.style.borderRadius = '4px';
+    liveTag.style.marginRight = '8px';
+    liveTag.style.fontWeight = 'bold';
+    liveTag.textContent = '● 正在抓流中（每秒实时刷新）';
+    name.prepend(liveTag);
+  }
 
   const meta = document.createElement('div');
   meta.className = 'meta';
-  // 时长放在最前面 —— 用户最想知道的就是"这个文件多长"，
-  // 而且必须是**文件自己的时长**，不是"这次操作持续了多久"
-  const durationText = formatDuration(item.seconds);
-  const parts = [
-    durationText ? `时长 ${durationText}` : '时长未记录',
-    formatBytes(item.size),
-    new Date(item.lastModified).toLocaleString(),
-    // 「已导出」是清理时的凭据：用户不会想删掉自己还没拿出来过的东西
-    item.exportedAt ? '已导出到磁盘' : '',
-    // 这条属于哪一类必须写在行里：三类文件混在一个列表里，名字只差几个字
-    // （`-部分` / `-自动部分` / 什么都不带），用户实测会当成同一批东西。
-    captureKindText(item.name, item.kind),
-  ].filter(Boolean);
-  meta.textContent = parts.join(' · ');
-  if (!durationText) meta.style.opacity = '.7';
-  if (item.exportedAt) meta.style.color = 'var(--ok, #4ade80)';
+
+  if (isCurrentLiveSnapshot) {
+    meta.setAttribute('data-live-snapshot', item.name);
+    meta.style.color = '#e2e8f0';
+    meta.textContent = formatLiveSnapshotMeta(item, state.record?.stats, state.record);
+  } else {
+    // 时长放在最前面 —— 用户最想知道的就是"这个文件多长"，
+    // 而且必须是**文件自己的时长**，不是"这次操作持续了多久"
+    const durationText = formatDuration(item.seconds);
+    const parts = [
+      durationText ? `时长 ${durationText}` : '时长未记录',
+      formatBytes(item.size),
+      new Date(item.lastModified).toLocaleString(),
+      // 「已导出」是清理时的凭据：用户不会想删掉自己还没拿出来过的东西
+      item.exportedAt ? '已导出到磁盘' : '',
+      // 这条属于哪一类必须写在行里：三类文件混在一个列表里，名字只差几个字
+      // （`-部分` / `-自动部分` / 什么都不带），用户实测会当成同一批东西。
+      captureKindText(item.name, item.kind),
+    ].filter(Boolean);
+    meta.textContent = parts.join(' · ');
+    if (!durationText) meta.style.opacity = '.7';
+    if (item.exportedAt) meta.style.color = 'var(--ok, #4ade80)';
+  }
 
   left.append(name, meta);
 
   const saveBtn = document.createElement('button');
   saveBtn.className = 'btn primary';
-  saveBtn.textContent = '保存到磁盘';
-  saveBtn.addEventListener('click', () => exportRecording(item.name));
+  if (isCurrentLiveSnapshot) {
+    saveBtn.textContent = '保存当前最新';
+    saveBtn.title = '把当前这一秒已抓取到的最新全部内容打包并保存到磁盘';
+    saveBtn.addEventListener('click', async () => {
+      await snapshotCapture();
+    });
+  } else {
+    saveBtn.textContent = '保存到磁盘';
+    saveBtn.addEventListener('click', () => exportRecording(item.name));
+  }
 
   const diagBtn = document.createElement('button');
   diagBtn.className = 'btn';
@@ -431,12 +635,21 @@ function mediaRow(item) {
 function renderGroup(boxId, items, emptyText) {
   const box = $(boxId);
   box.textContent = '';
-  if (!items.length) {
+  const isCapturing = boxId === 'captures'
+    && state.record?.stage === RECORD_STAGE.RECORDING
+    && state.record?.mode === 'mse';
+  const activeSnapName = getActiveSnapshotName();
+  const hasLive = Boolean(activeSnapName && items.some((m) => m.name === activeSnapName));
+
+  if (!items.length && !isCapturing) {
     const empty = document.createElement('div');
     empty.className = 'muted';
     empty.textContent = emptyText;
     box.append(empty);
     return;
+  }
+  if (isCapturing && !hasLive) {
+    box.append(liveCaptureRow());
   }
   for (const item of items) box.append(mediaRow(item));
 }
@@ -730,6 +943,8 @@ function render() {
   } else {
     target.textContent = '还没有指定目标标签页 —— 请在要录的页面上点工具栏图标发起。';
   }
+
+  updateLiveSnapshotElements();
 }
 
 async function refreshState() {
@@ -877,9 +1092,10 @@ function announceRecentCapture() {
   }
 
   const real = formatDuration(r.mediaSeconds);
+  const sizeStr = r.size ? `（${formatBytes(r.size)}）` : '';
   const lines = [
     r.title ? `来源：${r.title}` : '',
-    `${isMse ? '抓流' : '录制'}产物：${r.fileName}`,
+    `${isMse ? '抓流' : '录制'}产物：${r.fileName}${sizeStr}`,
     real ? `视频时长：${real}` : '',
     r.mediaSeconds && r.durationMs && Math.abs(r.durationMs / 1000 - r.mediaSeconds) > 2
       ? `（抓取过程用了 ${formatClock(r.durationMs)}，中间的暂停和拖动不算在文件时长里）`
@@ -894,7 +1110,10 @@ function announceRecentCapture() {
         + '，都在下面的「抓流文件」里'
       : '',
     r.note || '',
-    ...(r.warnings || []).slice(0, 3),
+    // ⚠️ 以前这里只显示前 3 条，结果把最关键的那几条挤掉了：
+    // 用户实测"产物里只有声音、画面整段没进"，而"这一组为什么没进产物"的说明
+    // 正好排在第 4 条 —— 提示卡里看不到，只能靠来回猜。诊断信息宁可多显示几条。
+    ...(r.warnings || []).slice(0, 8),
     '下面点「保存到磁盘」就能导出到你的下载目录。',
   ].filter(Boolean);
   showNotice('ok', `${isMse ? '抓流' : '录制'}完成`, lines.join('\n'));
@@ -971,23 +1190,27 @@ async function init() {
   // 「自动保存已录到的部分」：滚动覆盖、只留最新一份。
   // 间隔和**口径**（录制时间 / 视频内容时长）改动都立刻生效，不用重开抓流。
   $('autosnap').checked = settings.autoSnapshotCapture !== false;
-  $('autosnap-minutes').value = String([5, 10, 30].includes(Number(settings.autoSnapshotMinutes))
-    ? Number(settings.autoSnapshotMinutes) : 10);
+  const snapVal = Number(settings.autoSnapshotMinutes);
+  $('autosnap-minutes').value = String([0.5, 1, 5, 10, 30].includes(snapVal) ? snapVal : 10);
   $('autosnap-basis').value = settings.autoSnapshotBasis === 'media' ? 'media' : 'wall';
   $('autosnap').addEventListener('change', async (e) => {
     await setSettings({ autoSnapshotCapture: e.target.checked });
     $('autosnap-hint').hidden = !e.target.checked;
     $('autosnap-minutes').disabled = !e.target.checked;
     render();
+    const curVal = Number($('autosnap-minutes').value);
+    const snapLabel = curVal < 1 ? `${Math.round(curVal * 60)} 秒` : `${curVal} 分钟`;
     log(e.target.checked
-      ? `已开启：抓流期间每 ${$('autosnap-minutes').value} 分钟自动存一份已录到的部分（只留最新一份，`
+      ? `已开启：抓流期间每 ${snapLabel} 自动存一份已录到的部分（只留最新一份，`
         + `按${$('autosnap-basis').value === 'media' ? '视频内容时长' : '录制时间'}算）`
       : '已关闭自动保存已录到的部分：中途出意外就只能靠手动点「先保存已录到的部分」',
     e.target.checked ? 'ok' : 'warn');
   });
   $('autosnap-minutes').addEventListener('change', async (e) => {
-    await setSettings({ autoSnapshotMinutes: Number(e.target.value) });
-    log(`自动保存间隔已改为每 ${e.target.value} 分钟（正在进行的抓流也会用新值）`, 'ok');
+    const val = Number(e.target.value);
+    await setSettings({ autoSnapshotMinutes: val });
+    const label = val < 1 ? `${Math.round(val * 60)} 秒` : `${val} 分钟`;
+    log(`自动保存间隔已改为每 ${label}（正在进行的抓流也会用新值）`, 'ok');
   });
   $('autosnap-basis').addEventListener('change', async (e) => {
     await setSettings({ autoSnapshotBasis: e.target.value });
@@ -1040,9 +1263,20 @@ async function init() {
   $('diag-fix').addEventListener('click', fixDiag);
   $('clean-exported').addEventListener('click', cleanExported);
 
-  // 录制中每秒重画一次计时：本地跑，不等 service worker 推送
+  // 录制中每秒重画一次计时与实时抓流状态：本地跑，不等 service worker 推送
+  let timerTicks = 0;
   state.timer = setInterval(() => {
-    if (state.record?.stage === RECORD_STAGE.RECORDING) render();
+    if (state.record?.stage === RECORD_STAGE.RECORDING) {
+      render();
+      timerTicks += 1;
+      if (timerTicks % 3 === 0) {
+        renderStorageUse().catch(() => {});
+        const snapName = getActiveSnapshotName();
+        if (snapName && !state.media.some((m) => m.name === snapName)) {
+          refreshMedia();
+        }
+      }
+    }
   }, 1000);
 
   chrome.runtime.onMessage.addListener((msg) => {
@@ -1051,6 +1285,10 @@ async function init() {
     if (msg?.type === MSG.RECORD_STATE_PUSH) {
       state.record = msg.state;
       render();
+      const snapName = getActiveSnapshotName();
+      if (snapName && !state.media.some((m) => m.name === snapName)) {
+        refreshMedia();
+      }
       // 播完一集自动切出来的那段：当场说出来 + 刷新列表，
       // 这样它立刻出现在「抓流文件」里，用户能马上保存
       const cut = msg.state?.lastCut;

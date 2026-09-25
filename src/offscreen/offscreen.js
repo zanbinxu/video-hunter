@@ -32,7 +32,7 @@ import {
 import { createTsRemuxer } from '../parser/remuxer.js';
 import { mergeFmp4, parseInitSegment } from '../parser/mp4-merge.js';
 import { listInitTracks, listInitTrackIds } from '../parser/fmp4-file.js';
-import { demuxWebm } from '../parser/webm-demux.js';
+import { demuxWebm, isWebmInit, peekWebmClusterTimecode } from '../parser/webm-demux.js';
 import { mergeWebm, webmDurationSeconds } from '../parser/webm-merge.js';
 import { transcodeOpusToAac } from './audio-transcode.js';
 import {
@@ -311,6 +311,9 @@ function mseStart(msg = {}) {
     // 上一次「先保存已录到的部分」写的是什么内容（用来拒绝重复写同一份）
     lastSnapshot: null,
     snapshotTimer: null,
+    // 最近一次切集/切段完成的时间戳与当前集累计起始时间
+    lastCutAt: 0,
+    segmentStartedAt: Date.now(),
     // 这次会话里见过的初始化段，按大类（video/audio）存一份。
     // 用途见 assembleMseCapture 里的注释：播放器中途重建 SourceBuffer 时
     // 可能只补分片、不再补 init，而我们其实早就见过它了。
@@ -321,6 +324,17 @@ function mseStart(msg = {}) {
     // 每条流（分组键 → video/audio）先前分析出来的大类：给"只有分片"的那一组
     // 认领初始化段时用（见 assembleMseCapture 里的注释）
     seenStreamType: new Map(),
+    // 每条流最近一次识别出来的**容器**（webm / fmp4 / mpegts）：用来给"分片从中间续上"
+    // 的那一段定身份（见 mseBuffer 里的注释）
+    streamKind: new Map(),
+    // 每条流**实际收到的容器**各自多少字节：`${分组键}|${容器}` → 字节数。
+    //
+    // 为什么要它：播放器可以在**同一条 SourceBuffer 上 `changeType()`**，把这条流
+    // 从 WebM 换成 fMP4（或反过来）—— 分组键还是老 mime，字节却换了容器。
+    // 于是"在 WebM 里找 Cluster"再也找不到，后面整段丢（用户实测丢了 106 MB 画面）。
+    // 在收到的那一刻按容器记一笔，提示卡就能直接说清"这一组里混了两种容器"，
+    // 而不是让人对着一串十六进制猜。
+    containerBytes: new Map(),
     statsTimer: null,
   };
   // 每秒报一次进度。抓流是"边播边收"，用户需要看到它确实在动 ——
@@ -477,7 +491,8 @@ function setAutoSnapshot(config = {}) {
 async function runAutoSnapshot() {
   const s = mse;
   if (!s) return;
-  const mediaSeconds = mediaSpanSeconds(s);
+  const capSec = mediaCapturedSeconds(s);
+  const mediaSeconds = capSec ?? mediaSpanSeconds(s);
   // 「按视频内容时长」这一档要靠分片自己的 tfdt 算。WebM 那类流没有 tfdt ——
   // 那就**回落成挂钟**（自动保存是安全网，绝不能因为量不出来就永不触发），
   // 但要说明一次，否则用户会以为"明明设了 10 分钟却按别的节奏在存"。
@@ -503,6 +518,7 @@ async function runAutoSnapshot() {
     elapsedMs: Date.now() - s.startedAt,
     mediaSeconds,
     intervalMs: s.autoSnapshot.intervalMs,
+    initialMediaSeconds: 10,
   });
   if (plan !== 'write') {
     // 'off' / 'unchanged' / 'not-yet' 是正常情况，不必刷屏；另外两种值得留痕
@@ -540,7 +556,12 @@ async function runAutoSnapshot() {
   s.autoSnapshot = {
     ...s.autoSnapshot,
     fileName: written.fileName,
-    last: { bytes: s.bytes, chunks: s.items.length },
+    last: {
+      bytes: s.bytes,
+      chunks: s.items.length,
+      mediaSeconds: Number.isFinite(written.mediaSeconds) ? written.mediaSeconds : (Number.isFinite(mediaSeconds) ? mediaSeconds : null),
+      elapsedMs: Date.now() - s.startedAt,
+    },
   };
   // 这一份是离屏文档自己发起的，没有"请求-响应"那条路可以借，只能转发给 SW 记
   indexRemember({
@@ -556,11 +577,13 @@ async function runAutoSnapshot() {
   post({
     stage: RECORD_STAGE.RECORDING,
     mode: 'mse',
+    stats: mseStats(),
     autoSnapshot: {
       fileName: written.fileName,
       replaced: previous || null,
       mediaSeconds: written.mediaSeconds,
       at: Date.now(),
+      size: written.size,
     },
   });
   console.info('[vh/mse] 自动保存了一份已录到的部分：', written.fileName);
@@ -632,6 +655,14 @@ function mseStats() {
       const v = mediaSpanSeconds(mse);
       return v == null ? null : Math.round(v);
     })(),
+    mediaCapturedSeconds: (() => {
+      const v = mediaCapturedSeconds(mse);
+      return v == null ? null : Math.round(v);
+    })(),
+    mediaPlayheadSeconds: (() => {
+      const v = mediaPlayheadSeconds(mse);
+      return v == null ? null : Math.round(v);
+    })(),
     autoSnapshotBasis: mse.autoSnapshot?.basis ?? 'wall',
     // 「攒得太大自动切段」：配置 + 已经切了几次（界面上要能解释"怎么多了一个文件"）
     autoCutEnabled: mse.autoCut?.enabled ?? false,
@@ -650,49 +681,185 @@ function mseStats() {
  * 为什么清空而不是接着攒：分片自带的解码时间戳在换视频时通常从 0 重新开始，
  * 攒在一起会让时间轴倒着走，合并出来是一团乱。
  */
-async function mseCut(reason) {
+async function mseCut(reason, options = {}) {
   const s = mse;
   if (!s) return { ok: false, error: '当前没有在抓流' };
+  const assembledCount = options.cutAtIndex != null ? options.cutAtIndex : s.items.length;
   // 至少要有"初始化段 + 一段媒体"才算一次有效收尾，否则就是误报（不切）
-  if (s.items.length < 2) {
-    return { ok: false, error: '这一段还没抓到足够的数据', chunks: s.items.length, skipped: true };
+  if (assembledCount < 2) {
+    return { ok: false, error: '这一段还没抓到足够的数据', chunks: assembledCount, skipped: true };
   }
 
-  // 组装失败/抛异常都**不切、不清空**：缓冲区原样留着，用户下次收尾或手动
-  // 停止时还会把它一起写出去（同下面"写不进去时绝不清空缓冲"的道理）。
-  const built = await safeAssemble(s);
-  if (!built.ok) return { ...built, skipped: true };
-
-  const part = s.parts + 1;
-  const written = await saveBuilt(s, built, { part });
-  if (!written.ok) {
-    // ⚠️ 写不进去时**绝不清空缓冲**：抓流还在继续，用户清出空间之后
-    // 这一段的字节还在，下次收尾（或手动停止）会把它一起写出去。
-    return { ...written, part: s.parts, skipped: true };
+  // 换集时，如果数据量过小（例如换集过渡期的残留或误判），跳过切段；但基于阈值的自动切段（size）必须严格执行
+  const candidateItems = s.items.slice(0, assembledCount);
+  const candidateBytes = candidateItems.reduce((acc, it) => acc + (it.bytes?.byteLength || 0), 0);
+  if (reason !== 'manual' && reason !== 'size' && candidateBytes < 1.5 * 1024 * 1024) {
+    const capSec = mediaCapturedSeconds(s);
+    if (capSec == null || capSec < 5.0) {
+      console.info(`[vh/mse] 这一段数据过少（${(candidateBytes / 1024).toFixed(1)}KB / ${capSec ?? 0}s），视为换集过渡噪声碎片，跳过独立保存（原因: ${reason}）`);
+      return { ok: false, error: '换集过渡期数据过少，不保存为独立文件', chunks: assembledCount, skipped: true };
+    }
   }
-  s.parts = part;
-  // 这一段已经有完整的产物了，滚动保存那份就是它的子集，删掉
-  await dropAutoSnapshot();
-  // 清空，下一个视频从零开始
-  s.items = [];
-  s.bytes = 0;
 
-  return {
-    ok: true,
-    fileName: written.fileName,
-    size: written.size,
-    mediaSeconds: written.mediaSeconds,
-    part: s.parts,
-    reason: reason || '',
-    // 这一段的文件名 / 序号回给调用方：自动切段的提示要说清"存到哪了"
-    sizeCuts: s.autoCut?.cuts ?? 0,
-    // 换集/切段出来的**完整文件**也要自动导出（如果有开）——
-    // 用户在播放列表里最想要的正是"每集自动落到下载目录"
-    autoExport: await autoExportHandle(s, written.fileName),
-    compressedSeconds: written.finalized.compressedSeconds,
-    warnings: [...built.warnings, ...written.finalized.warnings],
-    detail: built.detail,
-  };
+  const lastAssembled = assembledCount;
+  s.cutting = true;
+  try {
+    // 组装失败/抛异常都**不切、不清空**：缓冲区原样留着，用户下次收尾或手动
+    // 停止时还会把它一起写出去（同下面"写不进去时绝不清空缓冲"的道理）。
+    const built = await safeAssemble(s, { cutAtIndex: lastAssembled });
+    if (!built.ok) return { ...built, skipped: true };
+
+    const part = s.parts + 1;
+    const written = await saveBuilt(s, built, { part });
+    if (!written.ok) {
+      // ⚠️ 写不进去时**绝不清空缓冲**：抓流还在继续，用户清出空间之后
+      // 这一段的字节还在，下次收尾（或手动停止）会把它一起写出去。
+      return { ...written, part: s.parts, skipped: true };
+    }
+    s.parts = part;
+    s.lastCutAt = Date.now();
+    s.segmentStartedAt = Date.now();
+    // 这一段已经有完整的产物了，滚动保存那份就是它的子集，删掉
+    await dropAutoSnapshot();
+
+    indexRemember({
+      name: written.fileName,
+      kind: MEDIA_KIND.CAPTURE,
+      seconds: written.mediaSeconds,
+      size: written.size,
+    });
+
+    // 清空已组装进这一段的分片；切段期间新到达的分片保留给下一段
+    s.items = s.items.filter((_, idx) => idx >= lastAssembled);
+    // 上一段截断处未完成的尾部分片（remainder）交接给下一段作为开头，
+    // 与后续到来的分片无缝拼接，彻底消除切段黑屏/掉帧缝隙。
+    // ⚠️ 换集（timeline-restart）时绝不能交接上一段末尾的 remainder（时间戳跨越导致黑屏/卡顿）
+    if (reason !== 'timeline-restart' && built.remainders && built.remainders.length > 0) {
+      const remainderItems = built.remainders.map((r, i) => ({
+        seq: -1000 + i,
+        mime: r.mime || '',
+        sbId: r.sbId || '',
+        bytes: r.bytes,
+        kind: r.kind || 'fmp4',
+      }));
+      s.items.unshift(...remainderItems);
+    }
+
+    if (options.nextTitle) {
+      s.title = String(options.nextTitle);
+    }
+
+    s.bytes = s.items.reduce((acc, it) => acc + (it.bytes?.byteLength || 0), 0);
+    const savedTimescales = new Map();
+    for (const [k, v] of s.media.entries()) {
+      if (v.timescale > 0) savedTimescales.set(k, v.timescale);
+    }
+    s.media.clear();
+    for (const [k, ts] of savedTimescales.entries()) {
+      s.media.set(k, { firstTicks: null, lastTicks: null, timescale: ts, ranges: [], estimatedFragTicks: 0 });
+    }
+    for (const it of s.items) {
+      trackMediaTime(s, it.mime, it.sbId, it.bytes);
+    }
+
+    return {
+      ok: true,
+      fileName: written.fileName,
+      size: written.size,
+      mediaSeconds: written.mediaSeconds,
+      part: s.parts,
+      reason: reason || '',
+      // 这一段的文件名 / 序号回给调用方：自动切段的提示要说清"存到哪了"
+      sizeCuts: s.autoCut?.cuts ?? 0,
+      // 换集/切段出来的**完整文件**也要自动导出（如果有开）——
+      // 用户在播放列表里最想要的正是"每集自动落到下载目录"
+      autoExport: await autoExportHandle(s, written.fileName),
+      compressedSeconds: written.finalized.compressedSeconds,
+      warnings: [...built.warnings, ...written.finalized.warnings],
+      detail: built.detail,
+    };
+  } finally {
+    s.cutting = false;
+  }
+}
+
+/** 探测新进来的分片是否标志着媒体时间轴重新从头开始（单页播放列表自动切集） */
+function isTimelineRestart(s, bytes, mime, sbId, kind) {
+  if (!s || s.cutting || s.items.length < 2) return false;
+  // 刚切过段（例如换集切收）不久，处于冷却期，绝不触发新的时间轴重置切段（避免把新一集的开头碎片单独切出去）
+  if (s.lastCutAt && (Date.now() - s.lastCutAt) < 15000) return false;
+
+  const capSec = mediaCapturedSeconds(s);
+  const segStart = s.segmentStartedAt || s.startedAt || Date.now();
+  const wallSec = (Date.now() - segStart) / 1000;
+  const runSec = Number.isFinite(capSec) && capSec > 0 ? capSec : wallSec;
+  if (runSec < 20) return false;
+
+  const key = contentTypeFromMime(mime) || `sb:${sbId || '未知'}`;
+  const entry = s.media.get(key);
+
+  if (kind === 'fmp4') {
+    const t = readFragmentMediaTime(bytes);
+    if (!t || t.baseMediaDecodeTime == null) return false;
+    let timescale = entry?.timescale || 0;
+    if (!timescale) {
+      for (const e of s.media.values()) {
+        if (e.timescale > 0) { timescale = e.timescale; break; }
+      }
+    }
+    if (!timescale) timescale = 1000;
+    const fragSec = t.baseMediaDecodeTime / timescale;
+    const lastTicks = entry?.lastTicks != null ? entry.lastTicks : null;
+    const trackSec = lastTicks != null && timescale > 0 ? (lastTicks / timescale) : runSec;
+    if (trackSec >= 20 && fragSec <= 3.0) {
+      return true;
+    }
+  } else if (kind === 'webm') {
+    const tcMs = peekWebmClusterTimecode(bytes);
+    if (tcMs != null) {
+      const tcSec = tcMs / 1000;
+      if (runSec >= 20 && tcSec <= 3.0) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** 异步执行时间轴归零切集保存上一集，并将新分片作为新一集的起点保留 */
+function triggerTimelineRestartCut(s, nextItem) {
+  if (s.lastCutAt && (Date.now() - s.lastCutAt) < 15000) return;
+  let cutIndex = s.items.length;
+  while (cutIndex > 0) {
+    const prev = s.items[cutIndex - 1];
+    if (hasTopLevelBox(prev.bytes, 'moov') || isWebmInit(prev.bytes)) {
+      cutIndex -= 1;
+    } else {
+      break;
+    }
+  }
+  if (cutIndex < 2) cutIndex = s.items.length;
+
+  s.items.push(nextItem);
+  s.bytes += nextItem.bytes.byteLength;
+
+  (async () => {
+    try {
+      const r = await mseCut('timeline-restart', { cutAtIndex: cutIndex });
+      if (r?.ok) {
+        post({
+          stage: RECORD_STAGE.RECORDING,
+          mode: 'mse',
+          stats: mseStats(),
+          autoExport: r.autoExport || null,
+          lastCut: { fileName: r.fileName, mediaSeconds: r.mediaSeconds, part: r.part, at: Date.now() },
+          captureNotice: `检测到单页连播切集（媒体时间轴归零），已自动将第 ${r.part} 集保存为完整文件（${r.fileName}），并无缝继续抓取新一集。`,
+        });
+      }
+    } catch (err) {
+      console.info('[vh/mse] 时间轴重置自动切集失败：', err);
+    }
+  })();
 }
 
 function mseBuffer(msg) {
@@ -704,10 +871,110 @@ function mseBuffer(msg) {
     mse.dropped += 1;
     return { ok: false, error: `base64 解码失败：${err?.message || err}` };
   }
-  mse.items.push({ seq: Number(msg.seq) || 0, mime: msg.mime || '', sbId: msg.sbId || '', bytes });
+  // 收到的那一刻就记一笔"这一段是什么容器"（O(1) 的魔数判断）。
+  // 分组键用的是 mime/编号，而播放器能在同一条 SourceBuffer 上换容器 ——
+  // 所以"键相同、容器不同"这件事必须在这一层才能看见（见 containerBytes 的注释）。
+  const key = msg.mime || `sb:${msg.sbId || ''}`;
+  const sniffedRaw = sniffContainer(bytes);
+  // `webm-no-init` 只是"这一段的头没抓到"、**同一个容器**；`unknown` 是"分片被切成两段、
+  // 这段从中间续上"的正常情况。两者都不能算换容器，否则同一个 SourceBuffer 的
+  // init 和分片会被拆成两组、甚至被丢掉。
+  const sniffed = sniffedRaw === 'webm-no-init' ? 'webm' : sniffedRaw;
+  const lastKind = mse.streamKind.get(key) || '';
+  const kind = sniffed === 'unknown' ? (lastKind || 'unknown') : sniffed;
+  if (sniffed !== 'unknown') mse.streamKind.set(key, sniffed);
+  const tallyKey = `${key}|${kind}`;
+  mse.containerBytes.set(tallyKey, (mse.containerBytes.get(tallyKey) || 0) + bytes.byteLength);
+
+  if (isTimelineRestart(mse, bytes, msg.mime, msg.sbId, kind)) {
+    triggerTimelineRestartCut(mse, { seq: Number(msg.seq) || 0, mime: msg.mime || '', sbId: msg.sbId || '', bytes, kind });
+    return { ok: true, chunks: mse.items.length, bytes: mse.bytes };
+  }
+
+  cleansePrefetchBeforeRewind(mse, bytes, msg.mime, msg.sbId, kind);
+
+  mse.items.push({ seq: Number(msg.seq) || 0, mime: msg.mime || '', sbId: msg.sbId || '', bytes, kind });
   mse.bytes += bytes.byteLength;
   trackMediaTime(mse, msg.mime, msg.sbId, bytes);
   return { ok: true, chunks: mse.items.length, bytes: mse.bytes };
+}
+
+/**
+ * 清除新一集起播时由于页面播放记忆残留的高时间戳预取分片。
+ * 当新分片时间戳在 0~3 秒，而缓冲开头已有 > 8 秒的分片（且总分片数 <= 10）时，
+ * 剔除那些高时间戳媒体分片（保留 init segment），确保从 0 秒干净起播。
+ */
+function cleansePrefetchBeforeRewind(s, bytes, mime, sbId, kind) {
+  if (!s || !s.items || s.items.length < 1 || s.items.length > 10) return;
+
+  const curKey = contentTypeFromMime(mime) || (sbId ? `sb:${sbId}` : '');
+  let curFragSec = null;
+  if (kind === 'fmp4') {
+    const t = readFragmentMediaTime(bytes);
+    if (t && t.baseMediaDecodeTime != null) {
+      const curMedia = curKey ? s.media.get(curKey) : null;
+      let timescale = curMedia?.timescale || 0;
+      if (!timescale) {
+        for (const [k, e] of s.media.entries()) {
+          if (curKey && k === curKey && e.timescale > 0) { timescale = e.timescale; break; }
+        }
+      }
+      if (!timescale) {
+        timescale = (curKey === 'video' || String(mime || '').startsWith('video/')) ? 90000 : 48000;
+      }
+      curFragSec = t.baseMediaDecodeTime / timescale;
+    }
+  } else if (kind === 'webm') {
+    const tcMs = peekWebmClusterTimecode(bytes);
+    if (tcMs != null) curFragSec = tcMs / 1000;
+  }
+
+  if (curFragSec == null || curFragSec > 3.0) return;
+
+  let hasRoguePrefetch = false;
+  for (const it of s.items) {
+    if (hasTopLevelBox(it.bytes, 'moov') || isWebmInit(it.bytes)) continue;
+    const itKey = contentTypeFromMime(it.mime) || (it.sbId ? `sb:${it.sbId}` : '');
+    // 关键隔离：只有同一条轨道的历史分片才能参与预取比对，严禁跨轨误判（例如音频分片不得比对视频分片）
+    if (curKey && itKey && itKey !== curKey) continue;
+
+    if (it.kind === 'fmp4') {
+      const pt = readFragmentMediaTime(it.bytes);
+      if (pt && pt.baseMediaDecodeTime != null) {
+        const itMedia = itKey ? s.media.get(itKey) : null;
+        let ts = itMedia?.timescale || 0;
+        if (!ts) {
+          ts = (itKey === 'video' || String(it.mime || '').startsWith('video/')) ? 90000 : 48000;
+        }
+        if ((pt.baseMediaDecodeTime / ts) > 8.0) { hasRoguePrefetch = true; break; }
+      }
+    } else if (it.kind === 'webm') {
+      const ptc = peekWebmClusterTimecode(it.bytes);
+      if (ptc != null && ptc > 8000) { hasRoguePrefetch = true; break; }
+    }
+  }
+
+  if (hasRoguePrefetch) {
+    console.info(`[vh/mse] 检测到轨道[${curKey || '未知'}]起播记忆预取的高时间戳分片，已自动清洗丢弃本轨脏分片，从 0:00 重新对齐`);
+    // 关键隔离：只清洗当前轨道的非初始化分片，严格保留其他轨道的正常分片和所有初始化段
+    s.items = s.items.filter((it) => {
+      if (hasTopLevelBox(it.bytes, 'moov') || isWebmInit(it.bytes)) return true;
+      const itKey = contentTypeFromMime(it.mime) || (it.sbId ? `sb:${it.sbId}` : '');
+      if (curKey && itKey && itKey !== curKey) return true; // 保留其他轨道
+      return false; // 清洗当前轨道的历史预取分片
+    });
+    s.bytes = s.items.reduce((acc, it) => acc + (it.bytes?.byteLength || 0), 0);
+    if (curKey && s.media.has(curKey)) {
+      const m = s.media.get(curKey);
+      m.firstTicks = null;
+      m.lastTicks = null;
+      m.ranges = [];
+      m.estimatedFragTicks = 0;
+    }
+    for (const it of s.items) {
+      trackMediaTime(s, it.mime, it.sbId, it.bytes);
+    }
+  }
 }
 
 /** 这个缓冲区里有没有某个顶层盒子（不分配、不解析，只走盒子头） */
@@ -747,28 +1014,160 @@ function trackMediaTime(s, mime, sbId, bytes) {
   const key = contentTypeFromMime(mime) || `sb:${sbId || '未知'}`;
   let entry = s.media.get(key);
   if (!entry) {
-    entry = { firstTicks: null, lastTicks: null, timescale: 0 };
+    entry = { firstTicks: null, lastTicks: null, timescale: 0, ranges: [], estimatedFragTicks: 0 };
     s.media.set(key, entry);
   }
+  const wantedType = (key === 'video' || key === 'audio') ? key : '';
   if (hasTopLevelBox(bytes, 'moov')) {
     try {
-      const info = parseInitSegment(bytes);
+      const info = parseInitSegment(bytes, { contentType: wantedType });
       const timescale = Number(info?.timescale) || 0;
+      if (s.seenInit) {
+        s.seenInit.set(info?.contentType || wantedType || 'video', bytes);
+      }
       // 换了 timescale 说明这条轨换了（换清晰度/换集）：重新开始量，
       // 不然两段不同刻度的 tick 混在一起，算出来的"内容时长"是假的
       if (timescale && timescale !== entry.timescale) {
         entry.timescale = timescale;
         entry.firstTicks = null;
         entry.lastTicks = null;
+        entry.ranges = [];
+        entry.estimatedFragTicks = 0;
       }
     } catch { /* moov 不完整或不是 fMP4，等下一块 */ }
   }
-  if (sniffContainer(bytes) !== 'fmp4') return;
-  const t = readFragmentMediaTime(bytes);
-  if (!t) return;
-  const ticks = t.baseMediaDecodeTime;
+
+  // 若当前轨道尚未获得 timescale，尝试从会话中已记录的初始化段提取（避免换集后未重发 moov 导致 timescale 为 0）
+  if (!entry.timescale && s.seenInit) {
+    for (const [k, initBytes] of s.seenInit.entries()) {
+      try {
+        const info = parseInitSegment(initBytes, { contentType: wantedType });
+        if (info?.timescale) {
+          entry.timescale = info.timescale;
+          break;
+        }
+      } catch {}
+    }
+    if (!entry.timescale) {
+      for (const [k, initBytes] of s.seenInit.entries()) {
+        try {
+          const info = parseInitSegment(initBytes);
+          if (info?.timescale) {
+            entry.timescale = info.timescale;
+            break;
+          }
+        } catch {}
+      }
+    }
+  }
+
+  const container = sniffContainer(bytes);
+  let ticks = null;
+  let fragDurationTicks = null;
+  if (container === 'fmp4') {
+    const t = readFragmentMediaTime(bytes);
+    if (t && t.baseMediaDecodeTime != null) {
+      ticks = t.baseMediaDecodeTime;
+      if (t.timescale && (!entry.timescale || entry.timescale === 1000)) {
+        entry.timescale = t.timescale;
+      }
+      if (t.durationTicks) {
+        fragDurationTicks = t.durationTicks;
+      }
+    }
+  } else if (container === 'webm' || container === 'webm-no-init') {
+    const tcMs = peekWebmClusterTimecode(bytes);
+    if (tcMs != null) {
+      if (!entry.timescale) entry.timescale = 1000;
+      ticks = tcMs;
+    }
+  }
+
+  if (ticks == null) return;
+
+  // 严禁将 fMP4 的 timescale 盲目默认为 1000！
+  // 在 fMP4 中，视频轨绝大多数为 90000（MPEG 标准），音频轨绝大多数为 48000 或 44100。
+  // 若误设为 1000，会导致每个分片的 180000 ticks 差值被误判为 180 秒空洞，
+  // 进而回退为每分片 2 秒的物理累加，使得倍速抓流时显示完全偏离真实视频时长。
+  if (!entry.timescale || entry.timescale === 1000) {
+    if (container === 'fmp4') {
+      if (wantedType === 'video' || key.includes('video')) {
+        entry.timescale = 90000;
+      } else if (wantedType === 'audio' || key.includes('audio')) {
+        entry.timescale = 48000;
+      } else {
+        // 未知轨道类型：若 ticks 较大（>50000），按 90000 计，否则按 1000 计
+        entry.timescale = ticks > 50000 ? 90000 : 1000;
+      }
+    } else {
+      entry.timescale = 1000;
+    }
+  }
+
   if (entry.firstTicks == null || ticks < entry.firstTicks) entry.firstTicks = ticks;
   if (entry.lastTicks == null || ticks > entry.lastTicks) entry.lastTicks = ticks;
+
+  // 跟踪连续抓取到的时间段（避免拖进度条/快进时将几千秒的空洞算作实际内容时长）
+  if (entry.timescale) {
+    const defaultFragTicks = fragDurationTicks || entry.estimatedFragTicks || Math.round(entry.timescale * 2);
+    if (!entry.ranges) entry.ranges = [];
+    if (entry.ranges.length === 0) {
+      entry.ranges.push({ start: ticks, end: ticks + defaultFragTicks, lastTicks: ticks });
+    } else {
+      const cur = entry.ranges[entry.ranges.length - 1];
+      // 放宽连续分片的最大间隔至 30 秒（倍速播放、高倍速快进或长 GOP 分片都不会断开）
+      const maxGapTicks = entry.timescale * 30;
+      if (ticks >= cur.lastTicks && (ticks - cur.lastTicks) <= maxGapTicks) {
+        const delta = ticks - cur.lastTicks;
+        if (delta > 0 && delta <= entry.timescale * 15) {
+          entry.estimatedFragTicks = delta;
+        }
+        cur.end = ticks + (fragDurationTicks || entry.estimatedFragTicks || defaultFragTicks);
+        cur.lastTicks = ticks;
+      } else {
+        // 跨越较大空洞或倒回（拖进度条/换集），开启新的连续区间
+        entry.ranges.push({ start: ticks, end: ticks + defaultFragTicks, lastTicks: ticks });
+      }
+    }
+  }
+}
+
+/** 抓到的实际视频内容累计时长（秒，已扣除拖进度条跳跃产生的巨大空洞；取最长的那条轨） */
+function mediaCapturedSeconds(s) {
+  let best = null;
+  for (const entry of s.media.values()) {
+    if (!entry.timescale || !entry.ranges || !entry.ranges.length) continue;
+    // 合并重叠或相交的区间
+    const sorted = [...entry.ranges].sort((a, b) => a.start - b.start);
+    let totalTicks = 0;
+    let curStart = sorted[0].start;
+    let curEnd = sorted[0].end;
+    for (let i = 1; i < sorted.length; i += 1) {
+      const next = sorted[i];
+      if (next.start <= curEnd) {
+        if (next.end > curEnd) curEnd = next.end;
+      } else {
+        totalTicks += (curEnd - curStart);
+        curStart = next.start;
+        curEnd = next.end;
+      }
+    }
+    totalTicks += (curEnd - curStart);
+    const sec = totalTicks / entry.timescale;
+    if (best === null || sec > best) best = sec;
+  }
+  return best;
+}
+
+/** 播放器当前播放/时间戳位置（秒，取最新的分片时间戳） */
+function mediaPlayheadSeconds(s) {
+  let best = null;
+  for (const entry of s.media.values()) {
+    if (entry.lastTicks == null || !entry.timescale) continue;
+    const sec = entry.lastTicks / entry.timescale;
+    if (best === null || sec > best) best = sec;
+  }
+  return best;
 }
 
 /** 抓到的内容在媒体时间轴上跨了多少秒（取最长的那条轨；算不出来返回 null） */
@@ -801,8 +1200,8 @@ function streamKeyOf(a) {
   return a.mime || `sb:${a.sbId || '未知'}`;
 }
 
-function assembleMseCapture(s) {
-  const { groups, duplicates } = groupBuffers(s.items);
+function assembleMseCapture(s, items = s.items) {
+  const { groups, duplicates } = groupBuffers(items);
   // 把 mime 一起带进分析结果：分组是按 mime 分的，后面报错、报诊断都要用它，
   // 而 analyzeGroup 只看字节，不该反过来知道分组的 key。
   const analyzed = groups.map((g) => ({ ...analyzeGroup(g), mime: g.mime, sbId: g.sbId || '' }));
@@ -816,12 +1215,9 @@ function assembleMseCapture(s) {
       if (a.container === 'webm') s.seenWebmHeader.set(streamKeyOf(a), a.init);
       else s.seenInit.set(a.contentType || 'video', a.init);
     }
-    // 这条流（按分组键：mime 或 sb:编号）**先前**被分析成什么大类 —— 这是给
-    // "只有分片、没有初始化段"的那一组认领 init 时**最准**的线索：分组键在整个
-    // 会话里是稳定的（同一个 SourceBuffer 的编号不会变），而真实站点上一批 append
-    // 根本没有 mime，光看分片字节推不出大类。trackId 也靠不住：实测 ffmpeg 产的
-    // 两条独立轨**都写 track 1**，撞号。
-    if (a.init && a.contentType) s.seenStreamType.set(streamKeyOf(a), a.contentType);
+    if (a.contentType && !s.seenStreamType.has(streamKeyOf(a))) {
+      s.seenStreamType.set(streamKeyOf(a), a.contentType);
+    }
   }
   // 借初始化段的候选项（**只含真正的 fMP4 moov**）—— 每条轨的 trackId 都要带上：
   // 自动切段会把缓冲清空，而播放器不会重发 moov，后面那些"只有分片"的组只能借
@@ -912,6 +1308,10 @@ function assembleMseCapture(s) {
         // 借到了就交给下面 WebM 那条路（拆包 + Opus→AAC 转码）—— 它要求 init 和 fragments 都在
         webmGroups.push({ ...a, init: header, fragments: a.raw, reusedInit: true });
         reusedInit.push(own || 'audio');
+        if (a.salvaged && a.skippedBytes) {
+          reuseNotes.push(`有一组音频数据（WebM，${Math.round(a.bytes / 1048576)}MB）检测到字节流错位，`
+            + `已跳过 ${a.skippedBytes} 字节错位残片并成功对齐到后续 Cluster`);
+        }
       } else {
         reuseNotes.push('有一组只有 WebM 的裸 Cluster、没有头部（Tracks），本次会话里也没有'
           + `可借的 —— 这一组 ${a.raw.byteLength} 字节没有进产物`);
@@ -923,6 +1323,10 @@ function assembleMseCapture(s) {
         handlers: listInitTracks(a.init),
         container: 'fmp4',
       });
+      if (a.salvaged && a.skippedBytes) {
+        reuseNotes.push(`有一组画面数据（fMP4，${Math.round(a.bytes / 1048576)}MB）检测到字节流错位，`
+          + `已跳过 ${a.skippedBytes} 字节错位内容并从后续分片成功救回`);
+      }
     } else if (a.missingInit && a.raw) {
       // 「只有分片、没有初始化段」——**但这次会话里早就见过一个**。
       //
@@ -949,6 +1353,7 @@ function assembleMseCapture(s) {
       if (picked) {
         const pickedType = picked.candidate.contentType || 'video';
         reusedInit.push(pickedType);
+        claimedTypes.add(pickedType);
         tracks.push({
           init: picked.candidate.init,
           fragments: a.raw,
@@ -956,6 +1361,10 @@ function assembleMseCapture(s) {
           container: 'fmp4',
           reusedInit: true,
         });
+        if (a.salvaged && a.skippedBytes) {
+          reuseNotes.push(`有一组画面数据（fMP4，${Math.round(a.bytes / 1048576)}MB）检测到字节流错位，`
+            + `已跳过 ${a.skippedBytes} 字节错位残片并成功救回后续媒体分片`);
+        }
         // 借来的 init 里如果没有这个 trackId，合并时这一组会被整条丢掉 ——
         // 以前这件事**完全静默**（用户只看到"这一段没声音"）。现在写进产物提示里。
         if (want != null && !(picked.candidate.trackIds || []).includes(want)) {
@@ -966,6 +1375,13 @@ function assembleMseCapture(s) {
         reuseNotes.push(`有一组只有分片、没有初始化段，而本次会话里也没有可以借的 —— `
           + `这一组 ${a.raw.byteLength} 字节没有进产物（解决办法：点抓流之后刷新页面从头来）`);
       }
+    } else {
+      // ⚠️ 以前这里**什么都没有**：认不出的组就静默消失了。用户实测过 87MB 画面
+      // 就这么没的，而提示卡上一句话都没有 —— 因为分支链一个都不匹配，等于无声无息。
+      // 诊断信息：带上容器、大类、体积和具体错误，下次一眼能看出是哪一组、为什么。
+      const why = a.error ? `：${a.error}` : '（既没有 init+分片，也没有 missingInit 标志）';
+      reuseNotes.push(`有一组没能用上（${a.container}/${a.contentType || a.mime || '?'}`
+        + `，${Math.round(a.bytes / 1048576)}MB）${why} —— 这一组没有进产物`);
     }
     // 认不出容器的组直接跳过；一条都认不出时下面会给出明确错误
   }
@@ -987,7 +1403,7 @@ function assembleMseCapture(s) {
     const detail = analyzed.map((a) => `${a.bytes} 字节（${a.container}${a.error ? '：' + a.error : ''}）`).join('；');
     return {
       ok: false,
-      error: `收到了 ${s.items.length} 段数据，但一段都认不出容器：${detail}`,
+      error: `收到了 ${items.length} 段数据，但一段都认不出容器：${detail}`,
     };
   }
 
@@ -1004,9 +1420,41 @@ async function finishAssembly(s, ctx) {
   let { video, audio } = ctx;
   const warnings = [];
   let transcoded = null;
+  // 诊断：这次到底收到了**哪几组**、各多大。
+  // 用户报"画面少了一截"时，这一行先把范围缩一半：是"只收到一组（那就是这条流本身缺）"
+  // 还是"收了好几组但只用了其中一组"（那条是另一个已知缺陷）。
+  if (analyzed.length > 1) {
+    warnings.push(`这次收到 ${analyzed.length} 组数据：`
+      + analyzed.map((a) => `${a.container}/${a.contentType || a.mime || '?'}`
+        + ` ${Math.round(a.bytes / 1048576)}MB`).join(' + '));
+  }
+  // 同一条流收到两种**识别出来的**容器 = 播放器在同一个 SourceBuffer 上换了容器
+  // （changeType）。解析器只会认第一种，换之后的整段都解析不出来 —— 用户实测丢了 106 MB 画面。
+  //
+  // ⚠️ 两个坑（第一版都踩了，靠浏览器回归的日志才发现）：
+  //   · `webm-no-init` 只是"这一段的头没抓到"，**同一个容器**，要归一成 webm；
+  //   · `unknown` 是"分片被切成两段、这段从中间续上"的正常情况，要忽略。
+  //   不这么处理，正常抓流也会被判成"换了容器"，那就成了狼来了。
+  const byStream = new Map();
+  for (const [k, n] of s.containerBytes || []) {
+    const [stream, rawKind] = k.split('|');
+    const kind = rawKind === 'webm-no-init' ? 'webm' : rawKind;
+    if (!byStream.has(stream)) byStream.set(stream, new Map());
+    const m = byStream.get(stream);
+    m.set(kind, (m.get(kind) || 0) + n);
+  }
+  for (const [stream, kinds] of byStream) {
+    const recognized = [...kinds.keys()].filter((k) => k !== 'unknown');
+    if (new Set(recognized).size > 1) {
+      warnings.push(`同一条流（${stream}）中途换了容器：`
+        + recognized.map((k) => `${k} ${Math.round(kinds.get(k) / 1048576)}MB`).join(' + ')
+        + ' —— 播放器在同一个 SourceBuffer 上换了格式，换之后的字节按老格式解析不出来，'
+        + '所以那一段之后的画面没进产物');
+    }
+  }
   // 拆出来的 WebM 轨道（画面 + 音频），走"存成 .webm"那条路
   const webmVideoTracks = [];
-  const webmAudioTracks = [];
+  let webmAudioTracks = [];
 
   for (const group of webmGroups) {
     let demuxed;
@@ -1023,6 +1471,96 @@ async function finishAssembly(s, ctx) {
     webmVideoTracks.push(...demuxed.tracks.filter((t) => t.type === 'video'));
     webmAudioTracks.push(...demuxed.tracks.filter((t) => t.type === 'audio'));
   }
+
+  // 画面这条流中途换了容器时，两种候选会同时存在（fMP4 一组 + WebM 一组）：
+  // 它们是**两种编码**，拼不成一条轨，只能保留内容更多的那一段 —— 但必须说出来，
+  // 不能像以前那样静默丢掉一部分（用户实测：视频流 webm 6MB + fmp4 63MB，丢了那 63MB）。
+  // 换编码时**两份都留下**：主产物是更长的那一段，另一段也自动另存一个文件（`-2`）——
+  // 文件名按顺序拼起来就是完整内容（和"攒太大自动切段"同一个口径）。
+  // 因为 VP9 和 AV1 塞不进同一条视频轨（播放器只认一条），"一个文件里全都有"做不到；
+  // 但"两份合起来一秒不丢"做得到 —— 用户的诉求就是结果要是完整的。
+  let extraProduct = null;
+  if (video && webmVideoTracks.length) {
+    const fmp4Bytes = video.fragments?.byteLength || 0;
+    const webmBytes = webmVideoTracks.reduce((sum, t) => sum + (t.frames || [])
+      .reduce((s, f) => s + (f.data?.byteLength || 0), 0), 0);
+    const mb = (n) => `${Math.round(n / 1048576)}MB`;
+    // 只有"WebM 更长 **且** 有 WebM 音轨可配（或本来就没音轨）"时才改走 WebM 那条路 ——
+    // 否则会把 fMP4 的音轨一起丢掉（WebM 封装装不了 AAC）。
+    const useWebm = webmBytes > fmp4Bytes && (webmAudioTracks.length > 0 || !audio);
+    if (useWebm) {
+      warnings.push(`画面这条流中途换了容器（fMP4 ${mb(fmp4Bytes)} → WebM ${mb(webmBytes)}）：`
+        + '两种编码拼不成一条轨，这一份保留了更长的 WebM 那一段');
+      // 另一段是 fMP4：这里不做（fMP4 那条路没法从"字节"里裁音轨），如实说明
+      warnings.push('另一种编码的那一段（fMP4）这次没有另存 —— 需要它的话请单独抓一次');
+      video = null;
+    } else {
+      // 另一段（WebM）也存一份：音轨按它的时间范围**裁一下**，否则那一份里音画对不上
+      // （音轨覆盖整段时间轴，视频只有那一段）。
+      try {
+        let from = Infinity;
+        let to = -Infinity;
+        for (const t of webmVideoTracks) {
+          for (const f of t.frames || []) {
+            from = Math.min(from, f.timeUs);
+            to = Math.max(to, f.timeUs + (f.durationUs || 0));
+          }
+        }
+        const inRange = (frames) => (Number.isFinite(from)
+          ? (frames || []).filter((f) => f.timeUs >= from && f.timeUs <= to)
+          : (frames || []));
+        const extraAudio = webmAudioTracks
+          .map((t) => ({ ...t, frames: inRange(t.frames) }))
+          .filter((t) => (t.frames || []).length);
+        extraProduct = finishWebmCapture(s, {
+          analyzed,
+          webmVideoTracks,
+          webmAudioTracks: extraAudio,
+          reusedInit,
+          reuseNotes: [],
+          duplicates: 0,
+          warnings: [],
+        });
+        if (extraProduct?.ok) {
+          // 判定 WebM 相对于主产物（fMP4）究竟是起播缓冲的「前一段」还是切换后的「后一段」
+          let fmp4StartUs = null;
+          try {
+            const fTime = readFragmentMediaTime(video.fragments);
+            const fInfo = parseInitSegment(video.init, { contentType: 'video' });
+            if (fTime?.baseMediaDecodeTime != null && fInfo?.timescale) {
+              fmp4StartUs = Math.round((fTime.baseMediaDecodeTime / fInfo.timescale) * 1e6);
+            }
+          } catch {}
+
+          let firstWebmSeq = Infinity;
+          let firstFmp4Seq = Infinity;
+          for (const it of items || []) {
+            if (it.kind === 'webm' && /video/i.test(it.mime || '')) {
+              firstWebmSeq = Math.min(firstWebmSeq, it.seq);
+            } else if (it.kind === 'fmp4' && /video/i.test(it.mime || '')) {
+              firstFmp4Seq = Math.min(firstFmp4Seq, it.seq);
+            }
+          }
+          const earlierByArrival = (firstWebmSeq !== Infinity && firstFmp4Seq !== Infinity)
+            ? (firstWebmSeq < firstFmp4Seq)
+            : false;
+
+          if (fmp4StartUs != null && Number.isFinite(from) && Math.abs(from - fmp4StartUs) > 1e6 && Math.abs(from - fmp4StartUs) < 600 * 1e6) {
+            extraProduct.isEarlierSegment = (from < fmp4StartUs);
+          } else {
+            extraProduct.isEarlierSegment = earlierByArrival || (from <= 3 * 1e6);
+          }
+        }
+        // 注意：主产物（fMP4）的音轨不能按 WebM 的时间戳裁剪！
+        // 音频轨通常覆盖整个播放时段（例如 00:00 到结束），裁剪会导致主产物后半段完全没有声音。
+        // 音视频两轨的对齐与尾部停滞保护已由 mp4-merge.js 的 applyEditLists 与 maxAudioEndUs 统一安全处理。
+      } catch (err) {
+        warnings.push(`另一种编码的那一段没能另存：${err?.message || err}`);
+      }
+    }
+  }
+  // 交给 safeAssemble 写盘（写盘只有一个收口，见那里的注释）
+  if (extraProduct?.ok) s.pendingExtra = extraProduct;
 
   // ---- 画面是 WebM 的流：出 .webm，**零转码** ----
   //
@@ -1112,10 +1650,45 @@ async function finishAssembly(s, ctx) {
     },
   });
 
+  // ---- 安全网（测试期加的，发布前会去掉）：产物里到底有没有我们喂进去的那几条轨 ----
+  //
+  // 用户实测过最难受的一种失败：**喂进去 56 MB 画面，产物却是一条纯音轨的 MP4**，
+  // 而界面上写着"成功"。合并这一步不会为"某条轨一个样本都没进去"报错 ——
+  // 所以这里自己读一遍产物的 moov，缺了哪条就明确说出来，不再让它冒充成功。
+  try {
+    // ⚠️ listInitTracks 返回的是**字符串数组**（例如 ['video']），不是对象数组 ——
+    // 第一版按 t.handler 取，结果全是 null，健康的产物也被判成"少了画面"（自己踩的假报警）。
+    const outHandlers = listInitTracks(merged).map((h) => String(h || ''));
+    const wantVideo = Boolean(video);
+    const wantAudio = Boolean(audio || transcoded);
+    const missing = [];
+    if (wantVideo && !outHandlers.includes('video')) missing.push('画面');
+    if (wantAudio && !outHandlers.includes('audio')) missing.push('声音');
+    if (missing.length) {
+      const fed = `${wantVideo ? `画面 ${((video?.fragments?.byteLength || 0) / 1048576).toFixed(1)}MB` : '无画面'}`
+        + ` / ${wantAudio ? '声音' : '无声音'}`;
+      warnings.push(`⚠️ 产物里少了【${missing.join('和')}】那条轨：喂进去的是 ${fed}，`
+        + `产物里只有 ${outHandlers.join('、') || '（认不出）'} —— 这一份不完整，`
+        + '请把这张提示卡整段发给开发者');
+    }
+  } catch (err) {
+    warnings.push(`产物轨检查没跑成：${err?.message || err}`);
+  }
+
+  const remainders = (analyzed || [])
+    .filter((a) => a.remainder && a.remainder.byteLength > 0)
+    .map((a) => ({
+      mime: a.mime || '',
+      sbId: a.sbId || '',
+      bytes: a.remainder,
+      kind: a.container || 'fmp4',
+    }));
+
   return {
     ok: true,
     kind: 'mp4',
     merged,
+    remainders,
     warnings: [
       ...(reusedInit.length
         ? [`这份抓流中途播放器重建过缓冲区、或者自动切过段（那些组只补了分片），`
@@ -1263,9 +1836,41 @@ async function autoExportHandle(s, fileName) {
  * 收尾那条路要**保住数据**（`crashed` 由调用方处理成"可重试"），
  * 后台那两条路**跳过这一次、绝不打断抓流**。
  */
-async function safeAssemble(s) {
+async function safeAssemble(s, options = {}) {
   try {
-    return await assembleMseCapture(s);
+    const items = options.items || (options.cutAtIndex != null ? s.items.slice(0, options.cutAtIndex) : s.items);
+    const built = await assembleMseCapture(s, items);
+    // ---- 换编码时"另一段"也写出来（写盘只有这一个收口，所以放这儿）----
+    // 主产物是更长的那一段，另一段（另一种编码）单独一份 `-2` ——
+    // 两份按文件名顺序合起来就是完整内容。用户实测的"片头片尾画面不动"就是因为
+    // 另一段没有被单独留下（那段时间轴上只有声音）。
+    if (built?.ok && s.pendingExtra?.ok) {
+      const extra = s.pendingExtra;
+      s.pendingExtra = null;
+      try {
+        const extraPart = extra.isEarlierSegment ? '前段' : '后段';
+        const written = await saveBuilt(s, extra, { part: extraPart });
+        if (written?.ok) {
+          const segName = extra.isEarlierSegment ? '前一段' : '后一段';
+          const roleHint = extra.isEarlierSegment
+            ? '该段为起播缓冲段，主文件为高清核心段'
+            : '该段为切换后段';
+          built.warnings = [...(built.warnings || []),
+            `${segName}（${extra.kind === 'webm' ? 'WebM' : 'MP4'}，`
+            + `${Math.round((extra.merged?.byteLength || 0) / 1048576)}MB）已另存为 `
+            + `${written.fileName} —— ${roleHint}，两份按时间顺序播放合起来即为完整内容`];
+        } else {
+          built.warnings = [...(built.warnings || []),
+            `另一种编码的那一段没能写出来：${written?.error || '未知原因'}`];
+        }
+      } catch (err) {
+        built.warnings = [...(built.warnings || []),
+          `另一种编码的那一段没能写出来：${err?.message || err}`];
+      }
+    } else if (s.pendingExtra) {
+      s.pendingExtra = null;
+    }
+    return built;
   } catch (err) {
     console.error('[vh/mse] 组装失败：', err);
     return { ok: false, crashed: true, error: String(err?.message || err) };
@@ -1495,6 +2100,7 @@ function finishWebmCapture(s, ctx) {
   let merged;
   try {
     merged = mergeWebm({
+      cutOnRestart: true,
       video: {
         codecId: video.codecId,
         width: video.width,
@@ -1513,13 +2119,20 @@ function finishWebmCapture(s, ctx) {
     return { ok: false, error: `WebM 封装失败：${err.message}` };
   }
 
-  warnings.push('抓到的流本身就是 WebM（画面 VP8/VP9/AV1 + Opus 音频），所以产物是 .webm，'
-    + '而且**一个字节都没有重新编码**');
+  const remainders = (analyzed || [])
+    .filter((a) => a.remainder && a.remainder.byteLength > 0)
+    .map((a) => ({
+      mime: a.mime || '',
+      sbId: a.sbId || '',
+      bytes: a.remainder,
+      kind: a.container || 'webm',
+    }));
 
   return {
     ok: true,
     kind: 'webm',
     merged,
+    remainders,
     seconds: webmDurationSeconds(audio ? [video, audio] : [video]),
     warnings: [
       ...(reusedInit.length
@@ -1587,14 +2200,29 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     case MSG.OFFSCREEN_MSE_DISCARD:
       sendResponse(mseDiscard());
       return false;
+    case 'vh:offscreen-mse-reset':
+      if (mse) {
+        mse.items = [];
+        mse.bytes = 0;
+        mse.containerBytes = new Map();
+        mse.streamKind = new Map();
+      }
+      sendResponse({ ok: true });
+      return false;
     case MSG.OFFSCREEN_MSE_AUTOSNAP:
       sendResponse(setAutoSnapshot(msg));
       return false;
     case MSG.OFFSCREEN_MSE_SNAPSHOT:
       mseSnapshot().then(sendResponse, (err) => sendResponse({ ok: false, error: String(err?.message || err) }));
       return true;
+    case MSG.OFFSCREEN_UPDATE_TITLE:
+      if (mse && msg.title) {
+        mse.title = String(msg.title);
+      }
+      sendResponse({ ok: true });
+      return false;
     case MSG.OFFSCREEN_MSE_CUT:
-      mseCut(msg?.reason).then(sendResponse, (err) => sendResponse({ ok: false, error: String(err?.message || err) }));
+      mseCut(msg?.reason, { nextTitle: msg?.nextTitle }).then(sendResponse, (err) => sendResponse({ ok: false, error: String(err?.message || err) }));
       return true;
     case MSG.OFFSCREEN_MSE_STOP:
       mseStop().then(sendResponse, (err) => sendResponse({ ok: false, error: String(err?.message || err) }));

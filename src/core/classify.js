@@ -222,7 +222,7 @@ export function formatBytes(n) {
   return `${v.toFixed(v >= 100 ? 0 : 1)} ${units[i]}`;
 }
 
-/** 人类可读时长 */
+/** 人类可读时长（统一包含两位小时 hh:mm:ss） */
 export function formatDuration(sec) {
   if (sec == null || !Number.isFinite(sec)) return '—';
   const s = Math.max(0, Math.round(sec));
@@ -230,5 +230,5 @@ export function formatDuration(sec) {
   const m = Math.floor((s % 3600) / 60);
   const ss = s % 60;
   const pad = (x) => String(x).padStart(2, '0');
-  return h > 0 ? `${h}:${pad(m)}:${pad(ss)}` : `${m}:${pad(ss)}`;
+  return `${pad(h)}:${pad(m)}:${pad(ss)}`;
 }

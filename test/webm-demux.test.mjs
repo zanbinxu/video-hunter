@@ -21,7 +21,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 import {
-  isWebm, isWebmClusterStart, parseWebmInit, splitWebmInit, demuxWebm, describeWebmTracks,
+  isWebm, isWebmClusterStart, isWebmInit, peekWebmClusterTimecode, parseWebmInit, splitWebmInit, demuxWebm, describeWebmTracks,
   WEBM_CODECS,
 } from '../src/parser/webm-demux.js';
 import { sniffContainer, analyzeGroup } from '../src/parser/mse-assemble.js';
@@ -343,4 +343,16 @@ test('混装：转码音频缺采样率/声道时要明确报错，不能产出�
     () => mergeFmp4({ audio: { aac: { ...audio, frames: [] } } }),
     /一帧都没有/,
   );
+});
+
+test('isWebmInit 与 peekWebmClusterTimecode 正确识别 WebM 头部与 Cluster 时间戳', () => {
+  const bytes = webmBytes();
+  assert.equal(isWebmInit(bytes), true);
+  assert.equal(isWebmInit(new Uint8Array([0, 1, 2, 3])), false);
+
+  const { init, media } = splitWebmInit(bytes);
+  assert.equal(isWebmInit(init), true);
+  assert.equal(isWebmClusterStart(media), true);
+  const tc = peekWebmClusterTimecode(media);
+  assert.ok(tc !== null && Number.isFinite(tc), `应当能够读出 Cluster 时间戳，实际 ${tc}`);
 });

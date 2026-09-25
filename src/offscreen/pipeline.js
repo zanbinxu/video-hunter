@@ -380,13 +380,137 @@ export async function createRecorder(opts) {
     try { onError?.(err); } catch { /* 上报失败不该再引发一次失败 */ }
   };
 
+  const nominalFrameDurationUs = Math.round(1e6 / frameRate);
+
+  // 首尾防卡死与对齐控制：
+  // 1. 头防卡：起播前若存在静态截图及静音，丢弃等待期画面与音频，从真实出帧起播点开始写入，防止开头画面定格
+  // 2. 尾防卡：视频播完画面停滞后，修剪超出视频末尾的多余静音/录音，确保音画同时收尾
+  let videoStarted = false;
+  let firstVideoCandidate = null;
+  let baseTimestampUs = null;
+  let startTimeoutTimer = null;
+  let lastVideoEndAdjustedUs = 0;
+  let pendingAudioBeforeStart = [];
+  const trailingAudioBuffer = [];
+
+  function commitVideoChunk(chunk, meta, adjustedTs) {
+    if (baseTimestampUs === null) {
+      baseTimestampUs = adjustedTs;
+    }
+    const muxerTs = Math.max(0, adjustedTs - baseTimestampUs);
+    muxer.addVideoChunk(chunk, meta, muxerTs);
+    session.bytes += chunk.byteLength;
+    const dur = chunk.duration || nominalFrameDurationUs;
+    const endUs = adjustedTs + dur;
+    if (endUs > lastVideoEndAdjustedUs) {
+      lastVideoEndAdjustedUs = endUs;
+    }
+    flushTrailingAudio(lastVideoEndAdjustedUs + 100_000);
+  }
+
+  function prunePendingAudioBefore(timestampUs) {
+    pendingAudioBeforeStart = pendingAudioBeforeStart.filter((item) => item.adjustedTs >= timestampUs);
+  }
+
+  function flushPendingAudio() {
+    const list = pendingAudioBeforeStart;
+    pendingAudioBeforeStart = [];
+    for (const item of list) {
+      handleAudioChunk(item.chunk, item.meta, item.adjustedTs);
+    }
+  }
+
+  function commitAudioChunk(chunk, meta, adjustedTs) {
+    if (baseTimestampUs === null) return;
+    const muxerTs = Math.max(0, adjustedTs - baseTimestampUs);
+    muxer.addAudioChunk(chunk, meta, muxerTs);
+    session.bytes += chunk.byteLength;
+  }
+
+  function flushTrailingAudio(upToAdjustedTs) {
+    while (trailingAudioBuffer.length > 0) {
+      const first = trailingAudioBuffer[0];
+      if (first.adjustedTs <= upToAdjustedTs) {
+        trailingAudioBuffer.shift();
+        commitAudioChunk(first.chunk, first.meta, first.adjustedTs);
+      } else {
+        break;
+      }
+    }
+  }
+
+  function handleAudioChunk(chunk, meta, adjustedTs) {
+    if (baseTimestampUs === null) {
+      pendingAudioBeforeStart.push({ chunk, meta, adjustedTs });
+      if (pendingAudioBeforeStart.length > 100) {
+        pendingAudioBeforeStart.shift();
+      }
+      return;
+    }
+
+    if (adjustedTs < baseTimestampUs - 50_000) {
+      return;
+    }
+
+    if (lastVideoEndAdjustedUs > 0 && adjustedTs > lastVideoEndAdjustedUs + 150_000) {
+      trailingAudioBuffer.push({ chunk, meta, adjustedTs });
+      if (trailingAudioBuffer.length > 50) {
+        const oldest = trailingAudioBuffer.shift();
+        commitAudioChunk(oldest.chunk, oldest.meta, oldest.adjustedTs);
+      }
+      return;
+    }
+
+    commitAudioChunk(chunk, meta, adjustedTs);
+  }
+
+  function onVideoChunk(chunk, meta) {
+    try {
+      const adjustedTs = clock.adjust('video', chunk.timestamp, chunk.duration || 0);
+
+      if (!videoStarted) {
+        if (!firstVideoCandidate) {
+          firstVideoCandidate = { chunk, meta, adjustedTs };
+          startTimeoutTimer = setTimeout(() => {
+            if (!videoStarted && firstVideoCandidate) {
+              videoStarted = true;
+              commitVideoChunk(firstVideoCandidate.chunk, firstVideoCandidate.meta, firstVideoCandidate.adjustedTs);
+              firstVideoCandidate = null;
+              flushPendingAudio();
+            }
+          }, 1500);
+          return;
+        }
+
+        clearTimeout(startTimeoutTimer);
+        const gap = adjustedTs - firstVideoCandidate.adjustedTs;
+        if (gap > 500_000) {
+          firstVideoCandidate = { chunk, meta, adjustedTs };
+          prunePendingAudioBefore(adjustedTs - 50_000);
+          startTimeoutTimer = setTimeout(() => {
+            if (!videoStarted && firstVideoCandidate) {
+              videoStarted = true;
+              commitVideoChunk(firstVideoCandidate.chunk, firstVideoCandidate.meta, firstVideoCandidate.adjustedTs);
+              firstVideoCandidate = null;
+              flushPendingAudio();
+            }
+          }, 1500);
+          return;
+        }
+
+        videoStarted = true;
+        commitVideoChunk(firstVideoCandidate.chunk, firstVideoCandidate.meta, firstVideoCandidate.adjustedTs);
+        firstVideoCandidate = null;
+        flushPendingAudio();
+      }
+
+      commitVideoChunk(chunk, meta, adjustedTs);
+    } catch (err) { fail(err); }
+  }
+
   const videoEncoder = new VideoEncoder({
     output: (chunk, meta) => {
-      try {
-        // 第三个参数显式给时间戳：采集停摆过的那段不写进产物（见 createTimelineCompressor）
-        muxer.addVideoChunk(chunk, meta, clock.adjust('video', chunk.timestamp, chunk.duration || 0));
-        session.bytes += chunk.byteLength;
-      } catch (err) { fail(err); }
+      onVideoChunk(chunk, meta);
     },
     error: fail,
   });
@@ -398,8 +522,8 @@ export async function createRecorder(opts) {
     audioEncoder = new AudioEncoder({
       output: (chunk, meta) => {
         try {
-          muxer.addAudioChunk(chunk, meta, clock.adjust('audio', chunk.timestamp, chunk.duration || 0));
-          session.bytes += chunk.byteLength;
+          const adjustedTs = clock.adjust('audio', chunk.timestamp, chunk.duration || 0);
+          handleAudioChunk(chunk, meta, adjustedTs);
         } catch (err) { fail(err); }
       },
       error: fail,
@@ -424,6 +548,8 @@ export async function createRecorder(opts) {
   const videoReader = videoProcessor.readable.getReader();
   session.readers.push(videoReader);
   const keyFrameEvery = Math.max(1, Math.round(frameRate * 2));
+  let forceKeyFrame = true;
+  let lastPumpFrameTs = null;
 
   const videoPump = (async () => {
     let i = 0;
@@ -432,14 +558,19 @@ export async function createRecorder(opts) {
         const { done, value: frame } = await videoReader.read();
         if (done) break;
         if (session.stopped || session.failure) { frame.close(); break; }
-        // 编码跟不上时主动丢帧，而不是让队列无限涨 —— 录制要的是「跟得上」，
-        // 不是「一帧不落」；队列爆掉会让整个进程卡死。
-        if (videoEncoder.encodeQueueSize > 6) {
+        // 编码队列上限适度放宽到 16 帧（防止初始硬件编码建立时的瞬间抖动造成丢帧）
+        if (videoEncoder.encodeQueueSize > 16) {
           session.dropped += 1;
+          forceKeyFrame = true;
           frame.close();
           continue;
         }
-        videoEncoder.encode(frame, { keyFrame: i % keyFrameEvery === 0 });
+        // 发生丢帧或帧间隔跳变时强制请求关键帧，彻底杜绝解码端因缺少参考帧而画面停滞的问题
+        const gapFromPrev = lastPumpFrameTs !== null ? (frame.timestamp - lastPumpFrameTs) : 0;
+        const isKey = forceKeyFrame || (gapFromPrev > 500_000) || (i % keyFrameEvery === 0);
+        videoEncoder.encode(frame, { keyFrame: isKey });
+        if (isKey) forceKeyFrame = false;
+        lastPumpFrameTs = frame.timestamp;
         frame.close();
         session.frames += 1;
         i += 1;
@@ -471,6 +602,13 @@ export async function createRecorder(opts) {
     })();
   }
 
+  const getCalculatedMediaSeconds = () => {
+    if (lastVideoEndAdjustedUs > 0 && baseTimestampUs !== null && lastVideoEndAdjustedUs > baseTimestampUs) {
+      return (lastVideoEndAdjustedUs - baseTimestampUs) / 1e6;
+    }
+    return clock.mediaSeconds;
+  };
+
   return {
     fileName,
     targetKind: recTarget.kind,
@@ -491,7 +629,7 @@ export async function createRecorder(opts) {
     get stalledMs() { return Math.round(clock.stalledUs / 1000); },
     get stallCount() { return clock.count; },
     /** 产物真实时长（秒）—— 界面显示时长只用它 */
-    get mediaSeconds() { return clock.mediaSeconds; },
+    get mediaSeconds() { return getCalculatedMediaSeconds(); },
 
     stats() {
       return {
@@ -502,21 +640,21 @@ export async function createRecorder(opts) {
         encodedQueue: videoEncoder.encodeQueueSize,
         stalledMs: Math.round(clock.stalledUs / 1000),
         stallCount: clock.count,
-        mediaSeconds: clock.mediaSeconds,
+        mediaSeconds: getCalculatedMediaSeconds(),
       };
     },
 
     /**
      * 收尾。顺序很重要：
-     *   停泵 → 停轨道 → 关 AudioContext → flush 编码器 → finalize 封装 →
+     *   停泵 → 停轨道 → 关 AudioContext → flush 编码器 → 尾部对齐修剪 → finalize 封装 →
      *   关/补写目标文件
-     * 反过来会丢最后几帧，或者写进一个还没 finalize 的文件。
      */
     async stop() {
       if (session.stopped) {
         return { ok: false, error: '没有正在进行的录制', fileName, alreadyStopped: true };
       }
       session.stopped = true;
+      if (startTimeoutTimer) clearTimeout(startTimeoutTimer);
 
       try { await Promise.all(session.readers.map((r) => r.cancel().catch(() => {}))); } catch { /* ignore */ }
       stream.getTracks().forEach((t) => t.stop());
@@ -524,8 +662,28 @@ export async function createRecorder(opts) {
       // 泵可能还在 await reader.read()，cancel 之后会 resolve，等它们退出
       await Promise.allSettled([videoPump, audioPump].filter(Boolean));
 
+      // 1. 先 flush 视频编码器，确保所有在途的视频帧完成编码并更新尾部时间戳
       try { await videoEncoder.flush(); } catch (err) { session.failure = session.failure || err; }
+
+      // 兜底提交未正式开始的候选首帧
+      if (!videoStarted && firstVideoCandidate) {
+        videoStarted = true;
+        commitVideoChunk(firstVideoCandidate.chunk, firstVideoCandidate.meta, firstVideoCandidate.adjustedTs);
+        firstVideoCandidate = null;
+        flushPendingAudio();
+      }
+
+      // 2. 再 flush 音频编码器
       if (audioEncoder) { try { await audioEncoder.flush(); } catch (err) { session.failure = session.failure || err; } }
+
+      // 3. 尾部修剪：仅写入到视频最后一帧结束时刻（lastVideoEndAdjustedUs + 33ms 容差）之前的音频
+      // 超出视频末尾的多余静音/录音全部丢弃，彻底消除结尾画面卡住不动现象
+      if (lastVideoEndAdjustedUs > 0) {
+        flushTrailingAudio(lastVideoEndAdjustedUs + 33_000);
+      } else {
+        flushTrailingAudio(Infinity);
+      }
+      trailingAudioBuffer.length = 0;
 
       try {
         muxer.finalize();
@@ -575,7 +733,7 @@ export async function createRecorder(opts) {
         stalledMs: Math.round(clock.stalledUs / 1000),
         stallCount: clock.count,
         // 真实时长：从时间轴算出来的，和挂钟无关
-        mediaSeconds: clock.mediaSeconds,
+        mediaSeconds: getCalculatedMediaSeconds(),
         targetKind: recTarget.kind,
         videoCodec: video.codec,
         videoVendor: video.vendorCodec,

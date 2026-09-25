@@ -120,6 +120,45 @@ function msePage(tracks) {
     // 自动保存那条用例要靠它才能验到"到点又存一份、并覆盖上一份"。
     const SLOW = new URLSearchParams(location.search).get('slow') === '1';
     const SLOW_MS = Number(new URLSearchParams(location.search).get('slowMs')) || 1200;
+    // ?reinit=1：喂到**一半**时再 append 一次初始化段 —— 播放器在原地重新初始化
+    // 同一条 SourceBuffer 就是这个形态（MSE 的 changeType / 重新预取都会这么干）。
+    // 用户 2026-09-24 的真实产物就是这么坏的：定档 4K、没换清晰度，产物里画面
+    // 停在 23.2 秒，后面十几分钟只剩音频。
+    const REINIT = new URLSearchParams(location.search).get('reinit') === '1';
+
+    /**
+     * 把一串 Cluster 从**中间**切开，好让"重新 init"落在中间。
+     *
+     * 按 EBML 自己的长度字段走（ID + size 都是变长整数），不靠字节搜索猜 ——
+     * 猜错了切在 Cluster 内部，坏的就不是"重新 init"这条路径了。
+     */
+    const splitClusters = (bytes) => {
+      const readVint = (at) => {
+        const first = bytes[at];
+        if (first === undefined || first === 0) return null;
+        let len = 1;
+        while (len <= 8 && !(first & (0x80 >> (len - 1)))) len += 1;
+        if (len > 8 || at + len > bytes.length) return null;
+        let value = first & (0xff >> len);
+        for (let i = 1; i < len; i += 1) value = value * 256 + bytes[at + i];
+        return { len, value };
+      };
+      const starts = [];
+      let at = 0;
+      while (at + 2 <= bytes.length) {
+        const id = readVint(at);
+        if (!id) break;
+        const size = readVint(at + id.len);
+        if (!size) break;
+        const end = at + id.len + size.len + size.value;
+        if (end > bytes.length) break;
+        starts.push(at);
+        at = end;
+      }
+      if (starts.length < 2) return null;
+      const cut = starts[Math.floor(starts.length / 2)];
+      return [bytes.slice(0, cut), bytes.slice(cut)];
+    };
 
     const load = async (name) => new Uint8Array(await (await fetch('/' + name)).arrayBuffer());
     const append = (sb, data) => new Promise((resolve, reject) => {
@@ -139,11 +178,37 @@ function msePage(tracks) {
         let n = 0;
         const feed = async (sb, label, spec) => {
           setStatus('append ' + label + ' 初始化段…');
-          await append(sb, await load(spec.init));
+          const initBytes = await load(spec.init);
+          await append(sb, initBytes);
           n += 1;
           for (let i = 0; i < spec.segments.length; i += 1) {
+            const data = await load(spec.segments[i]);
+            // 只对视频那条轨做（用户现场就是视频这条被重新初始化，音频那条没有）
+            if (REINIT && label === '视频' && i === 0) {
+              const halves = splitClusters(data);
+              if (halves) {
+                await append(sb, halves[0]);
+                n += 1;
+                setStatus('重新 append ' + label + ' 初始化段（模拟播放器原地重新初始化）');
+                // ⚠️ 第二份 init **必须和第一份不一样**：真实站点上换码率/换编码时，
+                // 新的初始化段本来就会变（分辨率、编码配置都变了）。而**逐字节相同**的
+                // 重复 append 会被抓流那一侧的指纹去重挡掉（那是对的行为），
+                // 根本走不到拆包 —— 那这条用例就白验了（写这条用例时先栽过一次）。
+                // 这里用 EBML 的 Void 元素做填充：规范允许、解析器会忽略、字节却变了。
+                const reinitBytes = new Uint8Array(initBytes.length + 3);
+                reinitBytes.set(initBytes, 0);
+                reinitBytes.set([0xec, 0x81, 0x00], initBytes.length);
+                await append(sb, reinitBytes);
+                n += 1;
+                await append(sb, halves[1]);
+                n += 1;
+                if (SLOW) await wait(SLOW_MS);
+                continue;
+              }
+              setStatus('样本切不开，退回普通喂法');
+            }
             setStatus('append ' + label + ' ' + (i + 1) + '/' + spec.segments.length);
-            await append(sb, await load(spec.segments[i]));
+            await append(sb, data);
             n += 1;
             if (SLOW) await wait(SLOW_MS);
           }

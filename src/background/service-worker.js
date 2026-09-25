@@ -519,6 +519,17 @@ async function onOffscreenState(msg) {
   // 顺序也要紧：放在关离屏文档之前 await，blob 就活在那个文档里。
   if (msg.autoExport) await autoExportProduct(msg.autoExport);
 
+  // 离屏文档自主切段（如时间轴归零切集/超出体积切段）产生的新产物，同步写入索引
+  if (msg.lastCut?.fileName) {
+    lastCutAt = msg.lastCut.at || Date.now();
+    await rememberProduct({
+      name: msg.lastCut.fileName,
+      kind: MEDIA_KIND.CAPTURE,
+      seconds: msg.lastCut.mediaSeconds,
+      size: msg.lastCut.size,
+    });
+  }
+
   // 采集结束后离屏文档就没用了，关掉省资源。
   // ⚠️ 用 idle 版：自动导出的 blob 就活在这个文档里，**下载没写完不能关**
   // （关早 = blob 失效 = 导出的文件断在半路）。
@@ -663,7 +674,7 @@ async function startMseCapture({ tabId, startAt = 0 }) {
  * 所以这里必须去重：**一次换集只切一次**。
  */
 let lastCutAt = 0;
-const CUT_DEBOUNCE_MS = 4000;
+const CUT_DEBOUNCE_MS = 10000;
 
 /* ------------------------------------------------------------------ *
  * 产物索引的写入（从离屏文档转发过来）
@@ -789,7 +800,7 @@ chrome.storage.onChanged.addListener(async (changes, area) => {
   } catch { /* 离屏文档可能正好没了，不影响 */ }
 });
 
-async function cutMseCapture(reason) {
+async function cutMseCapture(reason, options = {}) {
   const cur = await getRecording();
   if (cur?.stage !== RECORD_STAGE.RECORDING || cur.mode !== 'mse') {
     return { ok: false, error: '当前没有在抓流' };
@@ -813,9 +824,23 @@ async function cutMseCapture(reason) {
     return { ok: false, error: '刚切过，忽略这次的重复信号', debounced: true };
   }
 
+  let nextCombinedTitle = '';
+  if (options.nextTitle) {
+    const epTitle = String(options.nextTitle).trim();
+    const pageTitle = String(options.pageTitle || cur.pageTitle || '').trim();
+    nextCombinedTitle = epTitle;
+    if (pageTitle && !epTitle.includes(pageTitle) && !pageTitle.includes(epTitle)) {
+      nextCombinedTitle = `${pageTitle}-${epTitle}`;
+    }
+  }
+
   let res;
   try {
-    res = await chrome.runtime.sendMessage({ type: MSG.OFFSCREEN_MSE_CUT, reason });
+    res = await chrome.runtime.sendMessage({
+      type: MSG.OFFSCREEN_MSE_CUT,
+      reason,
+      nextTitle: nextCombinedTitle,
+    });
   } catch (err) {
     return { ok: false, error: `离屏文档没有响应：${err?.message || err}` };
   }
@@ -829,15 +854,25 @@ async function cutMseCapture(reason) {
   await autoExportProduct(res.autoExport);
 
   // ⚠️ 只有**真的切成功了**才启动静默窗口。
-  // 反过来的写法踩过：先把 lastCutAt 记下来再切，结果一次失败（曾经是
-  // `Maximum call stack size exceeded`）就把窗口吃掉，后面几秒的重复信号
-  // 全被忽略 —— 用户看到的是"明明换了视频却什么都没存"。
   lastCutAt = now;
 
-  await patchRecording({
+  const patch = {
     parts: res.part,
-    lastCut: { fileName: res.fileName, mediaSeconds: res.mediaSeconds, part: res.part, at: now },
-  });
+    lastCut: {
+      fileName: res.fileName,
+      mediaSeconds: res.mediaSeconds,
+      size: res.size,
+      detail: res.detail,
+      warnings: res.warnings,
+      part: res.part,
+      at: now,
+    },
+  };
+  if (nextCombinedTitle) {
+    patch.title = nextCombinedTitle;
+  }
+  await patchRecording(patch);
+
   // 索引统一在这里写（离屏文档没有 chrome.storage）
   await rememberProduct({
     name: res.fileName,
@@ -1080,9 +1115,11 @@ async function runStopMseCapture(cur, options = {}) {
     // 换集切过之后缓冲里可能什么都不剩 —— 那是**正常收尾**，不是失败。
     // 报成 ERROR 会让用户以为抓流出错了，而其实前面几段好好地躺在管理页里。
     const nothingLeft = /没有捕获到任何数据|没有正在进行的抓流/.test(res?.error || '');
-    if (nothingLeft && cur.parts > 0) {
+    const latestRec = (await getRecording().catch(() => null)) || cur;
+    const actual = (latestRec.parts > 0 ? latestRec : cur);
+    if (nothingLeft && actual.parts > 0) {
       const settled = {
-        ...cur,
+        ...actual,
         stage: RECORD_STAGE.READY,
         finishedAt: Date.now(),
         error: null,
@@ -1091,7 +1128,17 @@ async function runStopMseCapture(cur, options = {}) {
       };
       await setRecording(settled);
       notify({ type: MSG.RECORD_STATE_PUSH, state: settled });
-      return { ok: true, alreadyCut: true, parts: cur.parts, state: settled };
+      return {
+        ok: true,
+        alreadyCut: true,
+        parts: actual.parts,
+        state: settled,
+        fileName: actual.lastCut?.fileName || null,
+        size: actual.lastCut?.size || null,
+        mediaSeconds: actual.lastCut?.mediaSeconds || null,
+        detail: actual.lastCut?.detail || null,
+        warnings: actual.lastCut?.warnings || [],
+      };
     }
     const next = {
       ...cur,
@@ -1341,10 +1388,44 @@ async function handleMessage(msg, sender) {
       return { ...res, state: settled };
     }
 
+    case MSG.RECORD_TITLE_UPDATE: {
+      const cur = await getRecording();
+      if (cur?.stage === RECORD_STAGE.RECORDING && cur.mode === 'mse') {
+        const episodeTitle = String(msg.title || '').trim();
+        const pageTitle = String(msg.pageTitle || cur.pageTitle || '').trim();
+        let combined = episodeTitle;
+        if (pageTitle && !episodeTitle.includes(pageTitle) && !pageTitle.includes(episodeTitle)) {
+          combined = `${pageTitle}-${episodeTitle}`;
+        }
+        if (combined && combined !== cur.title) {
+          await patchRecording({ title: combined });
+          chrome.runtime.sendMessage({
+            type: MSG.OFFSCREEN_UPDATE_TITLE,
+            title: combined,
+          }).catch(() => {});
+        }
+      }
+      return { ok: true };
+    }
+
+    case MSG.RECORD_PLAYER_PROGRESS: {
+      const cur = await getRecording();
+      if (cur?.stage === RECORD_STAGE.RECORDING) {
+        const playerProgress = {
+          currentTime: Number(msg.currentTime) || 0,
+          duration: Number(msg.duration) || 0,
+          paused: !!msg.paused,
+          updatedAt: Date.now(),
+        };
+        await patchRecording({ playerProgress });
+      }
+      return { ok: true };
+    }
+
     case MSG.MSE_BOUNDARY: {
       // 内容脚本发现"这个视频播完了 / 页面换下一个了"。
       // 收尾成独立文件，然后接着抓下一个 —— 播放列表不会被连成一个文件。
-      const res = await cutMseCapture(msg.reason);
+      const res = await cutMseCapture(msg.reason, { nextTitle: msg.nextTitle, pageTitle: msg.pageTitle });
       if (res?.ok) {
         // 刚切完就去安排"再也没数据就自动收尾"（换集之后可能就没有下一集了）
         scheduleIdleFinish();

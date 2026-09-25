@@ -87,7 +87,13 @@ export function titlePart(title) {
  * @param {string} [ext] 扩展名（默认 mp4；全是 WebM 的流会存成 webm）
  */
 export function captureFileName(stamp, part = 1, title = '', ext = 'mp4') {
-  return `${CAPTURE_PREFIX}${titlePart(title)}${stamp}${part > 1 ? `-${part}` : ''}.${ext}`;
+  let partSuffix = '';
+  if (typeof part === 'string' && part) {
+    partSuffix = `-${part}`;
+  } else if (typeof part === 'number' && part > 1) {
+    partSuffix = `-${part}`;
+  }
+  return `${CAPTURE_PREFIX}${titlePart(title)}${stamp}${partSuffix}.${ext}`;
 }
 
 /**
@@ -166,16 +172,41 @@ export function captureFileKind(name) {
 export function autoSnapshotPlan({
   enabled, awaitingRetry, chunks, bytes, last,
   basis = 'wall', elapsedMs = 0, mediaSeconds = null, intervalMs = 0,
+  initialMediaSeconds = null,
 } = {}) {
   if (!enabled) return 'off';
   if (awaitingRetry) return 'retry-pending';
   if (!(chunks > 0)) return 'empty';
-  if (basis === 'media' && Number.isFinite(mediaSeconds)) {
-    if (!(mediaSeconds >= intervalMs / 1000)) return 'not-yet';
-  } else if (!(elapsedMs >= intervalMs)) {
-    return 'not-yet';
+
+  if (!last) {
+    if (initialMediaSeconds != null) {
+      if (basis === 'media' && Number.isFinite(mediaSeconds)) {
+        const targetSec = Math.min(initialMediaSeconds, intervalMs > 0 ? intervalMs / 1000 : initialMediaSeconds);
+        if (mediaSeconds < targetSec) return 'not-yet';
+      } else {
+        const targetMs = Math.min(initialMediaSeconds * 1000, intervalMs > 0 ? intervalMs : initialMediaSeconds * 1000);
+        if (elapsedMs < targetMs) return 'not-yet';
+      }
+    } else {
+      if (basis === 'media' && Number.isFinite(mediaSeconds)) {
+        if (intervalMs > 0 && !(mediaSeconds >= intervalMs / 1000)) return 'not-yet';
+      } else if (intervalMs > 0 && !(elapsedMs >= intervalMs)) {
+        return 'not-yet';
+      }
+    }
+    return 'write';
   }
-  if (last && last.chunks === chunks && last.bytes === bytes) return 'unchanged';
+
+  if (last.chunks === chunks && last.bytes === bytes) return 'unchanged';
+  if (intervalMs > 0) {
+    if (basis === 'media' && Number.isFinite(mediaSeconds)) {
+      const prevSec = Number.isFinite(last.mediaSeconds) ? last.mediaSeconds : 0;
+      if (mediaSeconds - prevSec < intervalMs / 1000) return 'not-yet';
+    } else {
+      const prevElapsed = Number.isFinite(last.elapsedMs) ? last.elapsedMs : 0;
+      if (elapsedMs - prevElapsed < intervalMs) return 'not-yet';
+    }
+  }
   return 'write';
 }
 

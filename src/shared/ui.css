@@ -87,7 +87,7 @@ main { padding: 16px 22px 40px; max-width: 980px; }
 }
 .variant:hover { border-color: #3d3d4a; background: #26262f; }
 .variant.is-selected { border-color: var(--brand-a); background: rgba(79,107,255,.1); }
-.variant .res { font-weight: 620; font-size: 14px; min-width: 96px; }
+.variant .res { font-weight: 620; font-size: 14px; min-width: 96px; word-break: break-all; overflow-wrap: anywhere; }
 .variant .meta { color: var(--dim); font-size: 12px; flex: 1; }
 .variant .tag {
   font-size: 11px; padding: 2px 8px; border-radius: 999px;

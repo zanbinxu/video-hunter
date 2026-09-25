@@ -44,18 +44,60 @@ function firstTimeUs(track) {
 }
 
 /**
+ * 把「时间轴重新从头开始」之后的帧切掉（同页换集兜底 cutOnRestart）。
+ * 宁可少收后半截，也绝不能把两集交错焊在同一条时间轴上。
+ */
+export function truncateAtTimelineRestart(frames, options = {}) {
+  if (!Array.isArray(frames) || frames.length < 2) return frames;
+  const minRunSeconds = options.minRunSeconds ?? 3;
+  const nearZeroSeconds = options.nearZeroSeconds ?? 3;
+  const firstUs = frames[0].timeUs;
+  let maxUs = firstUs;
+
+  for (let i = 1; i < frames.length; i += 1) {
+    const t = frames[i].timeUs;
+    const knownSec = (maxUs - firstUs) / 1e6;
+    const hereSec = (t - firstUs) / 1e6;
+    if (knownSec >= minRunSeconds && hereSec <= nearZeroSeconds && (maxUs - t) >= minRunSeconds * 1e6) {
+      return frames.slice(0, i);
+    }
+    if (t > maxUs) maxUs = t;
+  }
+  return frames;
+}
+
+/**
  * 把两条轨封成一个 WebM。
  *
  * @param {{video?: {codecId:string, width:number, height:number,
  *                   frames:Array<{timeUs:number, keyframe:boolean, data:Uint8Array}>},
  *          audio?: {codecId:string, sampleRate:number, channels:number, frames:Array},
+ *          cutOnRestart?: boolean,
  *          onWarning?: (msg:string)=>void}} input
  * @returns {Uint8Array}
  */
 export function mergeWebm(input = {}) {
-  const { video, audio } = input;
+  let { video, audio } = input;
   const warn = typeof input.onWarning === 'function' ? input.onWarning : () => {};
   if (!video && !audio) throw new Error('mergeWebm 需要至少一条轨（video 或 audio）');
+
+  const cutOnRestart = input.cutOnRestart !== false;
+  if (video && cutOnRestart) {
+    const originalLen = video.frames?.length || 0;
+    const truncated = truncateAtTimelineRestart(video.frames);
+    if (truncated.length < originalLen) {
+      warn(`WebM 画面轨检测到时间轴重启（换集），已截断保留第一集（丢弃后续 ${originalLen - truncated.length} 帧）`);
+    }
+    video = { ...video, frames: truncated };
+  }
+  if (audio && cutOnRestart) {
+    const originalLen = audio.frames?.length || 0;
+    const truncated = truncateAtTimelineRestart(audio.frames);
+    if (truncated.length < originalLen) {
+      warn(`WebM 音频轨检测到时间轴重启（换集），已截断保留第一集（丢弃后续 ${originalLen - truncated.length} 帧）`);
+    }
+    audio = { ...audio, frames: truncated };
+  }
 
   if (video) {
     if (!video.frames?.length) throw new Error('画面轨一帧都没有');
@@ -133,6 +175,17 @@ export function mergeWebm(input = {}) {
  * 这里两条轨的最后一帧我们都摸过，直接算最准。
  */
 export function webmDurationSeconds(tracks = []) {
+  // ⚠️ 必须和 mergeWebm 一样**整体减掉最早的起点**：从中间开始抓流时，
+  // 帧的时间戳是源流的绝对时间，不减就会把"源流时间轴的长度"当时长。
+  // 用户实测：产物只有 30 秒，管理页却显示 18:31（他当时播到第 18 分钟才开始抓），
+  // 于是"录了 7 分钟怎么才 6.8 MB"这个误会就是这么来的。
+  let originUs = Infinity;
+  for (const track of tracks) {
+    const first = (track?.frames || [])[0];
+    if (first) originUs = Math.min(originUs, first.timeUs);
+  }
+  const shift = Number.isFinite(originUs) ? originUs : 0;
+
   let endUs = 0;
   for (const track of tracks) {
     const frames = track?.frames || [];
@@ -140,5 +193,5 @@ export function webmDurationSeconds(tracks = []) {
     if (!last) continue;
     endUs = Math.max(endUs, last.timeUs + (last.durationUs || 0));
   }
-  return endUs > 0 ? endUs / 1e6 : null;
+  return endUs > 0 ? Math.max(0, endUs - shift) / 1e6 : null;
 }

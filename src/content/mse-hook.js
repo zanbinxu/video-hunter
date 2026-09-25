@@ -75,6 +75,7 @@
   // 于是整组被当成"认不出容器"丢掉 —— YouTube 上实测丢掉 0.68 MB。
   // 有了编号，这些流至少能各自成组，再靠字节自己（moov/EBML）判型。
   let nextSourceBufferId = 0;
+  const activeSourceBuffers = [];
   const idFor = (sb) => {
     if (!sb.__vhId) {
       nextSourceBufferId += 1;
@@ -89,6 +90,7 @@
       try {
         sb.__vhMime = String(args[0] || '');
         idFor(sb);
+        activeSourceBuffers.push(sb);
         sourceBuffersSeen += 1;
         post({ kind: 'sourcebuffer', mime: sb.__vhMime, sbId: sb.__vhId || '', mode: sb.mode || '' });
       } catch { /* 打标失败不影响播放 */ }
@@ -96,28 +98,81 @@
     };
   } catch { /* 有些环境没有 MediaSource，正常 */ }
 
-  /* ---- 2. 钩 appendBuffer ---- */
+  /* ---- 2. 钩 changeType（播放器中途无缝切换格式/编码时同步更新 MIME） ---- */
+  try {
+    if (typeof SourceBuffer.prototype.changeType === 'function') {
+      const origChangeType = SourceBuffer.prototype.changeType;
+      SourceBuffer.prototype.changeType = function patchedChangeType(type, ...args) {
+        try {
+          this.__vhMime = String(type || '');
+          post({ kind: 'sourcebuffer', mime: this.__vhMime, sbId: idFor(this), mode: this.mode || '', changed: true });
+        } catch { /* 打标失败不影响播放 */ }
+        return origChangeType.call(this, type, ...args);
+      };
+    }
+  } catch { /* 浏览器不支持 changeType 时忽略 */ }
+
+  /* ---- 3. 钩 appendBuffer ---- */
   try {
     const origAppend = SourceBuffer.prototype.appendBuffer;
     SourceBuffer.prototype.appendBuffer = function patchedAppendBuffer(data, ...rest) {
-      // 先把字节拷成 base64 再往下走：appendBuffer 之后页面可能转移或复用这块内存
+      // 1. 同步快照内存（Uint8Array.prototype.slice 纯底层内存拷贝，5MB 耗时 <0.2ms）
+      //    保证即使页面后续复用或修改原始 Buffer，抓到的数据也完全不受影响。
+      let copy = null;
       try {
         const view = describe(data);
         if (view && view.byteLength) {
-          post({
-            kind: 'buffer',
-            mime: this.__vhMime || '',
-            // 没有 mime 时，这条编号就是"这是哪条流"的唯一线索
-            sbId: idFor(this),
-            mode: this.mode || '',
-            size: view.byteLength,
-            base64: toBase64(view),
-          });
+          copy = view.slice();
         }
-      } catch { /* 拷贝或编码失败就放过，页面照常播放 */ }
-      return origAppend.call(this, data, ...rest);
+      } catch { /* 快照失败放行 */ }
+
+      // 2. 零等待！立刻放行原调用，让播放器与解码器在第一时间收到数据，消除转圈卡顿
+      let result;
+      try {
+        result = origAppend.call(this, data, ...rest);
+      } catch (err) {
+        throw err;
+      }
+
+      // 3. 将 base64 转码与 postMessage 放在微任务中执行，彻底不阻塞当前调用的执行
+      if (copy && copy.byteLength) {
+        try {
+          const mime = this.__vhMime || '';
+          const sbId = idFor(this);
+          const mode = this.mode || '';
+          const size = copy.byteLength;
+          if (!this.__vhInit && copy.byteLength < 5 * 1024 * 1024) {
+            this.__vhInit = { mime, sbId, mode, size, base64: toBase64(copy) };
+          }
+          queueMicrotask(() => {
+            try {
+              post({
+                kind: 'buffer',
+                mime,
+                sbId,
+                mode,
+                size,
+                base64: toBase64(copy),
+              });
+            } catch { /* 发送失败忽略 */ }
+          });
+        } catch { /* 调度失败忽略 */ }
+      }
+      return result;
     };
   } catch { /* 钩不上也不该让页面出错 */ }
+
+  // 接收来自隔离世界的控制指令（如录制开始时重放先前记录的初始化段）
+  window.addEventListener('message', (ev) => {
+    if (ev.source !== window || ev.data?.__vh !== 'mse-ctl') return;
+    if (ev.data.kind === 'replay_inits') {
+      for (const sb of activeSourceBuffers) {
+        if (sb.__vhInit) {
+          post({ kind: 'buffer', ...sb.__vhInit, isReplayedInit: true });
+        }
+      }
+    }
+  });
 
   /* ---- 3. 网页水印通常叠在视频上，顺手报一下有没有全屏覆盖层（仅供诊断） ---- */
   post({ kind: 'ready' });

@@ -177,6 +177,11 @@ export const MSG = {
   INDEX_FORGET: 'vh:index-forget',
   // 收尾当前这段并另起一段（不停止抓流）
   OFFSCREEN_MSE_CUT: 'vh:offscreen-mse-cut',
+  // 页面单集标题动态同步与更新
+  RECORD_TITLE_UPDATE: 'vh:record-title-update',
+  OFFSCREEN_UPDATE_TITLE: 'vh:offscreen-update-title',
+  // 页面播放器实时播放进度同步（当前播放时间与视频总时长）
+  RECORD_PLAYER_PROGRESS: 'vh:record-player-progress',
   // 广播
   MEDIA_UPDATED: 'vh:media-updated',
 };

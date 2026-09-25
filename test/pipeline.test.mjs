@@ -444,8 +444,31 @@ test('自动保存的两种口径：录制时间 vs 视频内容时长（倍速�
   assert.equal(autoSnapshotPlan({ ...base, basis: 'media', elapsedMs: 600000, mediaSeconds: null }), 'write',
     '量不出内容时长时按挂钟算，而不是永远不存');
   assert.equal(autoSnapshotPlan({ ...base, basis: 'media', elapsedMs: 1000, mediaSeconds: null }), 'not-yet');
-  // 内容和挂钟都没到点，别写
   assert.equal(autoSnapshotPlan({ ...base, basis: 'media', elapsedMs: 1000, mediaSeconds: 1 }), 'not-yet');
+});
+
+test('自动保存首份快照（10秒）与后续设定间隔滚动覆盖：前10秒出产物，之后按5分钟保存', () => {
+  const cfg = { enabled: true, chunks: 10, bytes: 50000, intervalMs: 300000, initialMediaSeconds: 10, basis: 'media' };
+  // 1. 媒体内容还没到 10 秒（例如 5 秒）→ not-yet
+  assert.equal(autoSnapshotPlan({ ...cfg, mediaSeconds: 5, elapsedMs: 5000 }), 'not-yet');
+
+  // 2. 媒体内容满 10 秒 → write（第一份快照触发）
+  assert.equal(autoSnapshotPlan({ ...cfg, mediaSeconds: 10, elapsedMs: 10000 }), 'write');
+
+  // 3. 第一份存完了，记录 last
+  const last1 = { chunks: 10, bytes: 50000, mediaSeconds: 10, elapsedMs: 10000 };
+
+  // 4. 满 15 秒（距离第一份才 5 秒，没到 5 分钟间隔）→ not-yet
+  assert.equal(autoSnapshotPlan({ ...cfg, chunks: 15, bytes: 80000, mediaSeconds: 15, elapsedMs: 15000, last: last1 }), 'not-yet');
+
+  // 5. 满 309 秒（距离第一份 299 秒，还没到 300 秒间隔）→ not-yet
+  assert.equal(autoSnapshotPlan({ ...cfg, chunks: 100, bytes: 500000, mediaSeconds: 309, elapsedMs: 309000, last: last1 }), 'not-yet');
+
+  // 6. 满 310 秒（距离第一份已满 300 秒 = 5 分钟间隔）→ write（第二份快照触发）
+  assert.equal(autoSnapshotPlan({ ...cfg, chunks: 102, bytes: 510000, mediaSeconds: 310, elapsedMs: 310000, last: last1 }), 'write');
+
+  // 7. 若数据没有变（播放器暂停未抓到新字节）→ unchanged
+  assert.equal(autoSnapshotPlan({ ...cfg, chunks: 102, bytes: 510000, mediaSeconds: 310, elapsedMs: 310000, last: { chunks: 102, bytes: 510000, mediaSeconds: 10 } }), 'unchanged');
 });
 
 /* ------------------------------------------------------------------ *

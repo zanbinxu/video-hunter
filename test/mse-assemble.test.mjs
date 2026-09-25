@@ -14,6 +14,7 @@ import {
   fingerprint, explainEmptyCapture, explainMissingInit, pickReusableInit,
 } from '../src/parser/mse-assemble.js';
 import { listInitTrackIds } from '../src/parser/fmp4-file.js';
+import { splitWebmInit } from '../src/parser/webm-demux.js';
 import { mergeFmp4 } from '../src/parser/mp4-merge.js';
 import { fixturePath, probe, videoStream, audioStream, writeTmp, hasFfprobe } from './helpers.mjs';
 
@@ -28,6 +29,14 @@ const readChunk = (name) => new Uint8Array(readFileSync(fixturePath('dash-split'
 /** 模拟一条轨被 append 进去的全过程：init 先来，然后是按序的分片 */
 function trackChunks(initName, prefix) {
   return [initName, ...chunkNames(prefix)].map(readChunk);
+}
+
+function concat(chunks) {
+  const total = chunks.reduce((n, c) => n + c.byteLength, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) { out.set(c, offset); offset += c.byteLength; }
+  return out;
 }
 
 /* ------------------------------------------------------------------ *
@@ -370,3 +379,112 @@ test('借初始化段：trackId 优先、撞号时按大类定、都没有才回
   assert.equal(pickReusableInit([], { contentType: 'audio', trackId: aId }), null);
   assert.equal(pickReusableInit(null, { contentType: 'audio', trackId: aId }), null);
 });
+
+test('fMP4 分片中途有错位或坏段时，analyzeGroup 能自动跳过错位救回所有完整分片', () => {
+  const init = readChunk('init-stream0.m4s');
+  const frag1 = readChunk('chunk-stream0-00001.m4s');
+  const frag2 = readChunk('chunk-stream0-00002.m4s');
+  // 模拟真实场景：frag1 后面插入一段非法的乱码字节（如页面刷新/重载截断导致的错位）
+  const garbage = new Uint8Array([0xc1, 0xba, 0xc1, 0x77, 0x32, 0xce, 0x03, 0x66, 0x00, 0x11, 0x22, 0x33]);
+  const corrupted = concat([init, frag1, garbage, frag2]);
+
+  const { groups } = groupBuffers([{ seq: 0, mime: 'video/mp4', bytes: corrupted }]);
+  const a = analyzeGroup(groups[0]);
+
+  assert.equal(a.container, 'fmp4');
+  assert.equal(a.salvaged, true, '应当标记为已救回（salvaged）');
+  assert.ok(a.init && a.init.byteLength > 0, '应当保留初始化段');
+  assert.ok(a.fragments && a.fragments.byteLength > 0, '应当救回媒体分片');
+  assert.ok(a.skippedBytes >= garbage.length, '应当记录跳过的损坏字节数');
+});
+
+test('自动切段无 moov 且开头包含 orphan mdat 残片时，analyzeGroup 能跳过残片救回后续合法的 fMP4 分片', () => {
+  const frag1 = readChunk('chunk-stream0-00001.m4s');
+  const frag2 = readChunk('chunk-stream0-00002.m4s');
+  // 模拟真实用户场景（YouTube 4K 切段导致开头是上一段遗留的 orphan mdat 字节：37 f7 89 26 d5 b3 b9 3f...）
+  const orphanMdat = new Uint8Array([0x37, 0xf7, 0x89, 0x26, 0xd5, 0xb3, 0xb9, 0x3f, 0xaa, 0xbb, 0xcc, 0xdd]);
+  const cutSegment = concat([orphanMdat, frag1, frag2]);
+
+  const { groups } = groupBuffers([{ seq: 0, mime: 'video/mp4', bytes: cutSegment }]);
+  const a = analyzeGroup(groups[0]);
+
+  assert.equal(a.container, 'fmp4', '应当成功救回并识别为 fmp4');
+  assert.equal(a.missingInit, true, '没有 moov，必须标出 missingInit 供上层借用先前保存的 init');
+  assert.equal(a.salvaged, true, '应当标记为已救回');
+  assert.equal(a.skippedBytes, orphanMdat.length, '应当准确记录跳过的切段残片字节数');
+  assert.ok(a.raw && a.raw.byteLength === frag1.byteLength + frag2.byteLength, 'raw 应当只包含干净合法的分片');
+});
+
+test('无 moov 的 fMP4 分片中途有超大非法 box 时，analyzeGroup 能跳过坏段救回前后分片', () => {
+  const frag1 = readChunk('chunk-stream0-00001.m4s');
+  const frag2 = readChunk('chunk-stream0-00002.m4s');
+  // 模拟真实场景（Request 7：第 11 个 box 声明的长度不合法，声称 3250241911 字节）
+  const badBox = new Uint8Array([
+    0xc1, 0xba, 0xc1, 0x77, // 超大 size (3250241911)
+    0x32, 0xce, 0x03, 0x66, // 非法 type
+    0xaa, 0xbb, 0xcc, 0xdd,
+  ]);
+  const corruptedNoInit = concat([frag1, badBox, frag2]);
+
+  const { groups } = groupBuffers([{ seq: 0, mime: 'video/mp4', bytes: corruptedNoInit }]);
+  const a = analyzeGroup(groups[0]);
+
+  assert.equal(a.container, 'fmp4');
+  assert.equal(a.missingInit, true);
+  assert.equal(a.salvaged, true);
+  assert.ok(a.skippedBytes >= badBox.length);
+  assert.ok(a.raw && a.raw.byteLength === frag1.byteLength + frag2.byteLength);
+});
+
+test('自动切段无 init 且 WebM 音频开头包含 orphan 残片时，analyzeGroup 能重对齐到下一个 Cluster', () => {
+  const bytes = new Uint8Array(readFileSync(fixturePath('webm-opus', 'audio.webm')));
+  const { media } = splitWebmInit(bytes);
+  const orphan = new Uint8Array([0x12, 0x34, 0x56, 0x78]);
+  const cutWebm = concat([orphan, media]);
+
+  const { groups } = groupBuffers([{ seq: 0, mime: 'audio/webm; codecs="opus"', bytes: cutWebm }]);
+  const a = analyzeGroup(groups[0]);
+
+  assert.equal(a.container, 'webm', '应当成功救回并识别为 webm');
+  assert.equal(a.missingInit, true, '没有 EBML 头，必须标出 missingInit 供上层借用先前保存的 init');
+  assert.equal(a.salvaged, true, '应当标记为已救回');
+  assert.equal(a.skippedBytes, orphan.length, '应当准确记录跳过的切段残片字节数');
+  assert.ok(a.raw && a.raw.byteLength === media.byteLength, 'raw 应当只包含对齐后的 Cluster 数据');
+});
+
+test('自动切段分片截断交接（remainder handover）：切段处未完成的分片被提取为 remainder，移交下一段拼合，实现 100% 无缝衔接', () => {
+  const frag1 = readChunk('chunk-stream0-00001.m4s');
+  const frag2 = readChunk('chunk-stream0-00002.m4s');
+
+  // 模拟自动切段（比如在 300MB 处）正好截断在 frag2 中间
+  const cutPoint = Math.floor(frag2.byteLength / 2);
+  const frag2_partA = frag2.slice(0, cutPoint);
+  const frag2_partB = frag2.slice(cutPoint);
+
+  // 第一段收到的字节：frag1 完整 + frag2 的前半段
+  const seg1Bytes = concat([frag1, frag2_partA]);
+  const { groups: g1 } = groupBuffers([{ seq: 0, mime: 'video/mp4', bytes: seg1Bytes }]);
+  const a1 = analyzeGroup(g1[0]);
+
+  // 第一段只保留完整收尾的 frag1，未完成的 frag2_partA 提取进 remainder
+  assert.equal(a1.container, 'fmp4');
+  assert.equal(a1.missingInit, true);
+  assert.equal(a1.raw.byteLength, frag1.byteLength, '第一段应精确停在最后一个完整分片末尾');
+  assert.ok(a1.remainder && a1.remainder.byteLength === frag2_partA.byteLength, '未完成的分片前半部应当进入 remainder');
+  assert.equal(a1.skippedBytes, 0, '交接给下一段的数据不计为丢字节');
+
+  // 第二段交接：上一段的 remainder + 第二段新到达的 frag2_partB
+  const seg2Bytes = concat([a1.remainder, frag2_partB]);
+  const { groups: g2 } = groupBuffers([{ seq: 0, mime: 'video/mp4', bytes: seg2Bytes }]);
+  const a2 = analyzeGroup(g2[0]);
+
+  // 第二段无缝还原出完整的 frag2，0 丢帧、0 字节丢失！
+  assert.equal(a2.container, 'fmp4');
+  assert.equal(a2.missingInit, true);
+  assert.equal(a2.raw.byteLength, frag2.byteLength, '第二段应当 100% 完整复原 frag2');
+  assert.equal(a2.skippedBytes, 0, '无缝衔接，不产生任何跳过字节');
+  assert.deepEqual([...a2.raw], [...frag2], '拼合还原的分片数据必须与原始分片逐字节一致');
+});
+
+
+

@@ -1,6 +1,6 @@
 {
   "name": "video-hunter",
-  "version": "0.2.2",
+  "version": "0.2.6",
   "private": true,
   "type": "module",
   "description": "浏览器媒体嗅探 + 直链下载 + HLS/TS 合并 + DASH 音视频合并 + 录制兜底",
@@ -20,6 +20,8 @@
     "serve": "node tools/fixture-server.mjs",
     "test": "node --test --test-isolation=none \"test/*.test.mjs\"",
     "verify": "node tools/check-syntax.mjs && node --test --test-isolation=none \"test/*.test.mjs\"",
+    "repro": "node --test --test-isolation=none \"test/repro/*.test.mjs\"",
+    "check-product": "node tools/product-check.mjs",
     "browser-check": "node tools/browser-check.mjs --port 9333 --e2e http://127.0.0.1:8791",
     "browser-check:extras": "node tools/browser-check.mjs --port 9333 --extras http://127.0.0.1:8791",
     "browser-check:all": "node tools/browser-check.mjs --port 9333 --e2e http://127.0.0.1:8791 --extras http://127.0.0.1:8791",

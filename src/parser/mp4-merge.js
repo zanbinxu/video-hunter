@@ -713,7 +713,16 @@ function writeDurationV0(bytes, box, value) {
  *        输出 trackId → 「影片时间 0 落在媒体时间轴的哪一点」（秒，可正可负），
  *        以及该轨在产物里的 timescale（对不上就放弃，说明 mp4-muxer 换了约定）
  */
-function applyEditLists(bytes, edits) {
+/**
+ * 两条轨的起点差超过这么多秒，就认定"不是真实的音画偏移，而是两条轨的时间基不同"。
+ *
+ * 依据：真实的音画起点差只有几十毫秒到几百毫秒（音频解码器延迟、编辑决定）；
+ * 超过 1.5 秒绝不是正常音画差（时间基不同或格式切换），绝不能写空编辑把视频推迟几十秒
+ * （那会导致开头几十秒画面停滞卡死只有声音），必须按 0 对齐。
+ */
+const MAX_PLAUSIBLE_ORIGIN_GAP_SECONDS = 1.5;
+
+function applyEditLists(bytes, edits, onWarning) {
   if (!edits.size) return bytes;
   const top = readBoxes(bytes);
   const moov = top.find((b) => b.type === 'moov');
@@ -760,8 +769,24 @@ function applyEditLists(bytes, edits) {
       entries = [{ segmentDuration: played, mediaTime }];
       trackDuration = played;
     } else {
-      // 这条轨比影片起点晚 |mediaTime|，用一条空编辑把它推后
+      // 这条轨比影片起点晚 |mediaTime|，正常情况（音频比画面晚几十毫秒）用一条空编辑把它推后。
+      //
+      // ⚠️ 但**两个来源的时间基不一样**时，这个"起点差"可以是几千秒：fMP4 分片带的 tfdt 是
+      // **源流的绝对时间**，而 WebM 的 Cluster 时间码**按段从 0 计**。用户实测：画面那条流
+      // 是从第 2202 秒（他拖到 36:42）开始抓的，声音那条流的标签却是 0 —— 照 2201 秒写空编辑，
+      // 整条画面就被推迟到 2201 秒之后，播放时 0~100 秒**完全没有画面**（画面不动、声音在走）。
+      //
+      // 真实音画偏移不会超过几秒，所以设一个上限：超过就**按 0 对齐**（这两条轨的内容其实是
+      // 同一段，只是标签不同），并如实写进产物提示。
       const delay = Math.round(-edit.seconds * movieTimescale);
+      if (-edit.seconds > MAX_PLAUSIBLE_ORIGIN_GAP_SECONDS) {
+        if (typeof onWarning === 'function') {
+          onWarning(`有一条轨的起点比影片原点晚了 ${Math.round(-edit.seconds)} 秒 —— `
+            + '这个量级多为两条轨时间基不同（fMP4 采用源流绝对时间，WebM Cluster 时间码相对从 0 计），'
+            + '已按 0 对齐并消除偏差，确保音画严格同步');
+        }
+        continue;
+      }
       entries = [
         { segmentDuration: delay, mediaTime: -1 },
         { segmentDuration: wholeTrack, mediaTime: 0 },
@@ -780,7 +805,21 @@ function applyEditLists(bytes, edits) {
   }
   if (!plans.length) return bytes;
 
-  const maxTrackDuration = plans.reduce((max, p) => Math.max(max, p.trackDuration), 0);
+  let maxTrackDuration = 0;
+  for (const trak of moovKids) {
+    if (trak.type !== 'trak') continue;
+    const plan = plans.find((p) => p.trak === trak);
+    if (plan) {
+      if (plan.trackDuration > maxTrackDuration) maxTrackDuration = plan.trackDuration;
+    } else {
+      const kids = readBoxes(bytes, trak.payloadStart, trak.payloadEnd);
+      const tkhd = kids.find((b) => b.type === 'tkhd');
+      if (tkhd) {
+        const dur = readDurationV0(bytes, tkhd) || 0;
+        if (dur > maxTrackDuration) maxTrackDuration = dur;
+      }
+    }
+  }
   const inserted = plans.reduce((sum, p) => sum + p.edts.length, 0);
   // moov 在 mdat 前面时（fastStart: 'in-memory' 就是），撑大 moov 会把 mdat 往后顶，
   // 所有 chunk 的绝对偏移都得跟着加
@@ -1161,7 +1200,22 @@ export function mergeFmp4(input = {}, options = {}) {
   const videoTrack = video ? toMicroSeconds(video, options) : null;
   const audioTrack = audio ? toMicroSeconds(audio, options) : null;
   const videoMicro = videoTrack ? videoTrack.micro : [];
-  const audioMicro = audioTrack ? audioTrack.micro : [];
+  let audioMicro = audioTrack ? audioTrack.micro : [];
+
+  // 结尾画面卡顿停滞保护：如果音频比视频长很多，播放器在视频放完最后一帧后会画面静止停顿直到音频结束。
+  // 修剪超过视频结束时刻（+0.5秒容差）的多余音频，让音画同步结束。
+  if (videoMicro.length > 0 && audioMicro.length > 0) {
+    const lastVideoSample = videoMicro[videoMicro.length - 1];
+    const videoEndUs = lastVideoSample.dtsUs + lastVideoSample.durationUs;
+    const maxAudioEndUs = videoEndUs + 500_000;
+    const initialAudioCount = audioMicro.length;
+    audioMicro = audioMicro.filter((s) => s.dtsUs <= maxAudioEndUs);
+    const trimmedAudio = initialAudioCount - audioMicro.length;
+    if (trimmedAudio > 0 && typeof options.onWarning === 'function') {
+      const trimmedSec = ((audioTrack.micro[initialAudioCount - 1].dtsUs - maxAudioEndUs) / 1e6).toFixed(1);
+      options.onWarning(`音频轨比视频轨长出 ${trimmedSec} 秒，已修剪多余尾部音频，消除结尾画面停滞`);
+    }
+  }
   if (!videoMicro.length && !audioMicro.length) throw new Error('两路输入都没有样本，没什么可合并的');
 
   // 时间轴被就地整理过（乱序 / 重复 / 负时间戳）要说出来：用户报过一次
@@ -1315,7 +1369,7 @@ export function mergeFmp4(input = {}, options = {}) {
     });
   }
 
-  return applyEditLists(new Uint8Array(buffer), edits);
+  return applyEditLists(new Uint8Array(buffer), edits, options.onWarning);
 }
 
 /** 合并前的体检信息，给 UI / 日志用（也算一种「我到底读了什么」的凭据）。 */

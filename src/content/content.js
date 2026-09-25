@@ -25,6 +25,9 @@
     MEDIA_ENDED: 'vh:media-ended',
     MSE_ARM: 'vh:mse-arm',
     MSE_BUFFER: 'vh:mse-buffer',
+    MSE_BOUNDARY: 'vh:mse-boundary',
+    RECORD_TITLE_UPDATE: 'vh:record-title-update',
+    RECORD_PLAYER_PROGRESS: 'vh:record-player-progress',
     INJECT_PAGE_BUTTONS: 'vh:inject-page-buttons',
     PAGE_DOWNLOAD_CLICK: 'vh:page-download-click',
   };
@@ -50,60 +53,306 @@
   let mseSendFailed = 0;
 
   /* ---------------------------------------------------------------- *
-   * 0b. 边界探测：这个视频播完了、页面要换下一个了
+   * 0b. 边界探测与单页列表切集：这个视频播完了、页面要换下一个了
    *
    * 播放列表 / 自动连播会把好几个视频连着放。如果不管，抓到的就是一条
    * 连续的时间轴 —— 合并出来是**一个**文件，里面装着好几集，用户没法分开保存。
    *
-   * 所以这里盯着三个信号，任何一个出现就报一次边界，让后台把当前这段收尾成
+   * 所以这里盯住五个信号，任何一个出现就报一次边界，让后台把当前这段收尾成
    * 一个完整文件、清空缓冲接着抓下一个：
    *
    *   · `ended`      —— 最准的"这一集播完了"
    *   · `emptied` / `loadstart` —— 媒体元素换了资源（用户点了下一个、站点切集）
    *   · 新的 `addSourceBuffer`  —— 播放器重建了 MediaSource（换集常见做法）
-   *
-   * 三个信号经常在几秒内一起出现，所以只负责"上报"，去重交给后台
-   * （见 service-worker.js 里的 MSE_BOUNDARY 处理）。
+   *   · 单页播放列表高亮项变动  —— 侧边栏集数切换（如从 01 集切到 02 集）
+   *   · 播放进度到头 / 归零重播 —— 进度条到达 99.5% 或从末尾跳回开头
    * ---------------------------------------------------------------- */
 
   let boundaryWatched = new WeakSet();
   let boundaryTimer = null;
   let boundaryScanTimer = null;
+  let lastKnownEpisodeTitle = '';
+  const videoProgressTracker = new WeakMap();
 
-  function reportBoundary(reason) {
+  function isAccentColor(str) {
+    if (!str || typeof str !== 'string') return false;
+    const m = str.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+    if (!m) return false;
+    const r = parseInt(m[1], 10);
+    const g = parseInt(m[2], 10);
+    const b = parseInt(m[3], 10);
+    // 高亮红/橙色系（如用户界面的红字 #ef4444 或 rgb(239,68,68)）
+    if (r > 160 && r > g * 1.35 && r > b * 1.35) return true;
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    if (max > 120 && (max - min) > 70) return true;
+    return false;
+  }
+
+  function extractCleanText(el) {
+    if (!el) return '';
+    try {
+      const clone = el.cloneNode(true);
+      clone.querySelectorAll('script, style, svg, button, .duration, .time, [class*="time"]').forEach((c) => c.remove());
+      let text = clone.innerText || clone.textContent || '';
+      text = text.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
+      text = text.replace(/\(?\b\d{1,2}:\d{2}(?::\d{2})?\b\)?$/g, '').trim();
+      text = text.replace(/^(正在播放|播放中|已学完|试看|连播)[:：\s]*/g, '').trim();
+      return text;
+    } catch {
+      return '';
+    }
+  }
+
+  function isValidEpisodeTitle(text) {
+    if (!text || typeof text !== 'string') return false;
+    const clean = text.trim();
+    if (clean.length < 3 || clean.length > 120) return false;
+    if (/^[\d\s:.-]+$/.test(clean)) return false;
+    if (/^(首页|目录|课程介绍|下载|播放|暂停|全屏|倍速|弹幕|选集|上一集|下一集)$/.test(clean)) return false;
+    return true;
+  }
+
+  function detectPlaylistEpisodeTitle() {
+    // 1. 扫描具有播放中/活跃态类名的元素
+    const candidateSelectors = [
+      '.video-item.active', '.catalog-item.active', '.lesson-item.active', '.chapter-item.active',
+      '.episode-item.active', '.section-item.active', '.list-item.active',
+      '.cur-play', '.video-title-active', '.play-item-active', '.playing-item',
+      '[aria-selected="true"]', '[aria-current="true"]', '[data-active="true"]',
+      '.active', '.current', '.selected', '.playing', '.is-active', '.is-current',
+      '[class*="active"][class*="item"]', '[class*="current"][class*="item"]',
+      '[class*="playing"][class*="item"]',
+    ];
+
+    for (const sel of candidateSelectors) {
+      const els = document.querySelectorAll(sel);
+      for (const el of els) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        const text = extractCleanText(el);
+        if (isValidEpisodeTitle(text)) return text;
+      }
+    }
+
+    // 2. 扫描包含音频波形/播放图标的列表项
+    const playingIcons = document.querySelectorAll('svg, i, span, img');
+    for (const icon of playingIcons) {
+      const cls = (icon.className && typeof icon.className === 'string') ? icon.className.toLowerCase() : '';
+      const name = (icon.getAttribute('name') || icon.getAttribute('data-icon') || '').toLowerCase();
+      const isPlaying = cls.includes('play') || cls.includes('equalizer') || cls.includes('wave')
+        || cls.includes('volume') || cls.includes('music') || name.includes('play') || name.includes('sound');
+      if (isPlaying) {
+        const parent = icon.closest('li, [role="listitem"], .list-group-item, div[class*="item"], div[class*="lesson"]');
+        if (parent) {
+          const text = extractCleanText(parent);
+          if (isValidEpisodeTitle(text)) return text;
+        }
+      }
+    }
+
+    // 3. 扫描列表中具有突出红色/强调色样式的项目（如单页连播站点高亮集数）
+    const listItems = document.querySelectorAll('li, [role="listitem"], div[class*="item"], div[class*="lesson"], div[class*="chapter"]');
+    for (const item of listItems) {
+      if (item.children.length > 10) continue;
+      const style = window.getComputedStyle(item);
+      if (isAccentColor(style.color)) {
+        const text = extractCleanText(item);
+        if (isValidEpisodeTitle(text)) return text;
+      }
+      for (const span of item.querySelectorAll('span, a, p, div')) {
+        const sStyle = window.getComputedStyle(span);
+        if (isAccentColor(sStyle.color)) {
+          const text = extractCleanText(span);
+          if (isValidEpisodeTitle(text)) return text;
+        }
+      }
+    }
+
+    // 4. 扫描视频播放器区域下方或上方的专属标题栏
+    const titleContainers = document.querySelectorAll(
+      '.video-title, .course-title, .lesson-title, .player-title, [class*="video-title"], [class*="player-title"]'
+    );
+    for (const el of titleContainers) {
+      const text = extractCleanText(el);
+      if (isValidEpisodeTitle(text)) return text;
+    }
+
+    return '';
+  }
+
+  /**
+   * 自动切集重置起点看护器：
+   * 在单页播放列表自动连播切入下一集时，很多平台（如常见单页连播站点、B站等）会自动读取
+   * 播放记忆（例如跳到上次看过的 11:35 或中间位置），导致第二集录制从中间开始、
+   * 缺失前半段。看护器在切集发生后的起播窗口（10秒内）自动将视频进度条拉回 0:00，
+   * 确保完整录制整集。
+   */
+  const episodeRewindGuard = {
+    armed: false,
+    armedAt: 0,
+    rewound: false,
+
+    arm(reason = '') {
+      this.armed = true;
+      this.armedAt = Date.now();
+      this.rewound = false;
+      console.info(`[vh/content] 切集看护已激活 (${reason})，将在新一集起播时守卫拉回 0:00 起点`);
+    },
+
+    disarm() {
+      this.armed = false;
+    },
+
+    check(v) {
+      if (!this.armed || !v || this.rewound) return;
+      const elapsed = Date.now() - this.armedAt;
+      if (elapsed > 10000) {
+        this.disarm();
+        return;
+      }
+
+      const cur = Number.isFinite(v.currentTime) ? v.currentTime : 0;
+      // 判定是否是播放记忆的突发跳跃：
+      // 在起播前 5 秒内，如果当前时间突变到大于 2.0 秒且显著大于自然播放耗时，说明被播放记忆拉向了中间，立即拉回到 0:00 起点
+      const naturalMax = (elapsed / 1000) + 1.5;
+      if (cur > 2.0 && cur > naturalMax) {
+        this.rewound = true;
+        console.info(`[vh/content] 发现新一集由于播放记忆跳转到中间 (${cur.toFixed(1)}s)，自动拉回进度条起点 0:00 以完整录制新集`);
+        try {
+          v.currentTime = 0;
+        } catch (e) {
+          console.warn('[vh/content] 自动拉回起点失败：', e);
+        }
+        setTimeout(() => this.disarm(), 1500);
+      }
+    },
+  };
+
+  let lastProgressReportTime = 0;
+
+  function reportBoundary(reason, extra = {}) {
     if (!mseArmed) return;
-    // 本地也做一道最小间隔，别让一个换集动作连发十几条消息
     const now = Date.now();
-    if (boundaryTimer && now - boundaryTimer < 1500) return;
+    if (boundaryTimer && now - boundaryTimer < 6000) return;
     boundaryTimer = now;
-    // ⚠️ 但**上报没成功**时要把窗口放开。换集往往在几百毫秒里连发好几个信号
-    // （`loadstart` / `emptied` / 新的 SourceBuffer），而"第一条被后台拒了"时
-    // —— 最常见的原因是这一段的数据还不够收尾（`skipped`）—— 后面那几条
-    // 就是唯一的补救机会；本地这道窗口比后台的更严，就会把它一起吃掉，
-    // 结果那一集什么都没存，界面上还看不出任何异常。
-    // 后台那边只在**真的切成功**之后才启动它自己的去重窗口（见 cutMseCapture）。
-    chrome.runtime.sendMessage({ type: MSG.MSE_BOUNDARY, reason })
+    chrome.runtime.sendMessage({ type: MSG.MSE_BOUNDARY, reason, pageTitle: document.title || '', ...extra })
       .then((res) => {
         if (res && res.ok === false) boundaryTimer = null;
       })
       .catch(() => { boundaryTimer = null; });
   }
 
+  function checkEpisodeAndProgress() {
+    if (!mseArmed) return;
+
+    // 1. 扫描当前播放的具体集数标题并实时向后台同步
+    const curTitle = detectPlaylistEpisodeTitle();
+    if (curTitle) {
+      if (!lastKnownEpisodeTitle) {
+        lastKnownEpisodeTitle = curTitle;
+        chrome.runtime.sendMessage({
+          type: MSG.RECORD_TITLE_UPDATE,
+          title: curTitle,
+          pageTitle: document.title || '',
+        }).catch(() => {});
+      } else if (curTitle !== lastKnownEpisodeTitle) {
+        // 单页应用在未刷新情况下切换了播放列表集数
+        const prevTitle = lastKnownEpisodeTitle;
+        lastKnownEpisodeTitle = curTitle;
+        episodeRewindGuard.arm(`集数切换: ${curTitle}`);
+        reportBoundary('episode-title-change', { prevTitle, nextTitle: curTitle });
+        return;
+      }
+    }
+
+    // 2. 监测 <video> 的播放进度与尾部跳转
+    const vids = document.querySelectorAll('video');
+    let activeVideo = null;
+
+    for (const v of vids) {
+      episodeRewindGuard.check(v);
+
+      const dur = Number.isFinite(v.duration) ? v.duration : 0;
+      const cur = Number.isFinite(v.currentTime) ? v.currentTime : 0;
+
+      if (!activeVideo && (!v.paused || cur > 0)) {
+        activeVideo = v;
+      }
+
+      if (dur > 15) {
+        let tracker = videoProgressTracker.get(v);
+        if (!tracker) {
+          tracker = { maxTime: cur, lastTime: cur, reportedEnd: false };
+          videoProgressTracker.set(v, tracker);
+        }
+        if (cur > tracker.maxTime) tracker.maxTime = cur;
+
+        // 条件 A：播放进度到达最后 0.8 秒（即将自动切集或已播完）
+        if (!tracker.reportedEnd && cur >= dur - 0.8) {
+          tracker.reportedEnd = true;
+          episodeRewindGuard.arm('播至末尾');
+          reportBoundary('video-near-end', { nextTitle: curTitle });
+        }
+
+        // 条件 B：先前播放过较长时间（> 20 秒），播放位置突然回跳到前 2.5 秒以内
+        if (tracker.maxTime >= Math.min(dur - 2, 20) && cur <= 2.5 && (tracker.lastTime - cur) > 10) {
+          tracker.maxTime = cur;
+          tracker.reportedEnd = false;
+          episodeRewindGuard.arm('播放位置复位');
+          reportBoundary('video-time-reset', { nextTitle: curTitle });
+        }
+
+        tracker.lastTime = cur;
+      }
+    }
+
+    // 3. 上报当前活跃播放器的实时进度与总时长
+    if (!activeVideo && vids.length > 0) {
+      activeVideo = [...vids].sort((a, b) => (b.duration || 0) - (a.duration || 0))[0];
+    }
+    const now = Date.now();
+    if (activeVideo && (now - lastProgressReportTime >= 800)) {
+      lastProgressReportTime = now;
+      const cur = Number.isFinite(activeVideo.currentTime) ? activeVideo.currentTime : 0;
+      const dur = Number.isFinite(activeVideo.duration) && activeVideo.duration > 0 ? activeVideo.duration : 0;
+      chrome.runtime.sendMessage({
+        type: MSG.RECORD_PLAYER_PROGRESS,
+        currentTime: cur,
+        duration: dur,
+        paused: !!activeVideo.paused,
+      }).catch(() => {});
+    }
+  }
+
   function watchBoundaries() {
     const attach = (m) => {
       if (boundaryWatched.has(m)) return;
       boundaryWatched.add(m);
-      m.addEventListener('ended', () => reportBoundary('ended'));
+      m.addEventListener('ended', () => {
+        episodeRewindGuard.arm('ended事件');
+        reportBoundary('ended');
+      });
       m.addEventListener('emptied', () => reportBoundary('emptied'));
-      m.addEventListener('loadstart', () => reportBoundary('loadstart'));
+      m.addEventListener('loadstart', () => {
+        episodeRewindGuard.check(m);
+        reportBoundary('loadstart');
+      });
+      m.addEventListener('loadedmetadata', () => episodeRewindGuard.check(m));
+      m.addEventListener('canplay', () => episodeRewindGuard.check(m));
+      m.addEventListener('play', () => episodeRewindGuard.check(m));
+      m.addEventListener('playing', () => episodeRewindGuard.check(m));
+      m.addEventListener('seeked', () => episodeRewindGuard.check(m));
+      m.addEventListener('timeupdate', () => episodeRewindGuard.check(m));
     };
     for (const m of document.querySelectorAll('video,audio')) attach(m);
+    checkEpisodeAndProgress();
   }
 
   function boundaryScanStart() {
     watchBoundaries();
-    // 单页应用里换集可能换出一个全新的 <video>，所以要持续扫
-    if (!boundaryScanTimer) boundaryScanTimer = setInterval(watchBoundaries, 1500);
+    // 单页应用里换集可能换出一个全新的 <video>，且列表可能异步渲染，持续轮询看护
+    if (!boundaryScanTimer) boundaryScanTimer = setInterval(watchBoundaries, 1000);
   }
 
   function boundaryScanStop() {
@@ -231,10 +480,27 @@
     const until = Date.now() + GUARD_MS;
     const lastSeen = new Map(); // 元素 -> { time, wallMs }
     const complained = new WeakSet();
+    // 跟踪每个元素的定位状态：防止在正在 seek 或刚触发 seek 的缓冲期间重复拨动导致播放器死循环
+    const seekState = new WeakMap(); // 元素 -> { target, requestedAt, reached }
 
     const seekTo = (m, target) => {
       try {
+        if (m.seeking) return false;
+        if (m.readyState < 1) {
+          m.addEventListener('loadedmetadata', () => {
+            try { if (!m.seeking) m.currentTime = target; } catch { /* ignore */ }
+          }, { once: true });
+          return false;
+        }
         m.currentTime = target;
+        // seek 结束后尝试自动恢复播放，避免一直停留在黑屏/首帧
+        const onSeeked = () => {
+          m.removeEventListener('seeked', onSeeked);
+          if (m.paused && typeof m.play === 'function') {
+            m.play().catch(() => { /* autoplay 限制静默忽略 */ });
+          }
+        };
+        m.addEventListener('seeked', onSeeked, { once: true });
         return true;
       } catch {
         return false; // metadata 还没到，下一轮再试
@@ -248,6 +514,18 @@
         try { t = m.currentTime; } catch { continue; }
         if (!Number.isFinite(t)) continue;
 
+        // 如果媒体当前正在 seek 中，绝不能再去碰 currentTime 打断它
+        if (m.seeking) {
+          lastSeen.set(m, { time: t, wallMs: now });
+          continue;
+        }
+
+        let state = seekState.get(m);
+        if (!state || state.target !== guardTarget) {
+          state = { target: guardTarget, requestedAt: 0, reached: false };
+          seekState.set(m, state);
+        }
+
         const prev = lastSeen.get(m);
         // 播放倍速要算进去 —— 12 倍速下，400 毫秒的轮询间隔里播放位置会前进
         // 4.8 秒，那是**正常播放**，不是跳变。
@@ -259,24 +537,23 @@
 
         let action = '';
         if (guardTarget > 0) {
-          // ⚠️ 这里**不能**写成"离目标超过容差就拨回"。
-          //
-          // 那样写的第一版被用户当场抓到：目标是 3600 秒时，**正常播放**每过
-          // 2.5 秒就"离目标 2.5 秒"，于是每 2.5 秒被拉回目标一次 ——
-          // 用户看到的是"播放 3 秒一直往后退，永远播不过 3 秒"。
-          // 正常播放本来就会离目标越来越远，那不是漂移。
-          //
-          // 两条真正要管的：
-          //   · 掉到目标**之前**（站点从头播、或中途把位置重置）→ 拨回目标；
-          //   · 往前**跳**（超出正常播放的前进量，而且落到了目标之后很远）
-          //     → 拨回目标，否则中间那一段谁都没抓到。
-          if (prev) {
-            if (t < guardTarget - GUARD_TOLERANCE) action = 'behind';
-            else if ((t - prev.time) > expected + GUARD_TOLERANCE
-              && t > guardTarget + GUARD_TOLERANCE) action = 'ahead';
-          } else if (t < guardTarget - GUARD_TOLERANCE) {
-            // 第一次看到它：比目标还靠前就拨过去（站点从头播就是这种情况）
-            action = 'behind';
+          // 目标 > 0（从当前进度抓）
+          if (t >= guardTarget - GUARD_TOLERANCE) {
+            // 已经到达目标区域
+            state.reached = true;
+            if (prev && (t - prev.time) > expected + GUARD_TOLERANCE
+              && t > guardTarget + GUARD_TOLERANCE) {
+              action = 'ahead';
+            }
+          } else {
+            // 当前位置在目标之前（如页面加载初期的 0 秒，或中途被重置回 0）
+            if (state.reached) {
+              // 曾经到达过目标，后来被重置回开头了 → 必须拉回目标
+              action = 'behind';
+            } else if (!state.requestedAt || (now - state.requestedAt > 3500)) {
+              // 刚进入或者距离上次请求 seek 已经超过 3.5 秒仍未到达 → 触发一次定位，并给足缓冲时间
+              action = 'behind';
+            }
           }
         } else if (prev) {
           // 目标是 0（老行为）：只有"往前跳"才扳回
@@ -289,6 +566,7 @@
         if (action) {
           const from = t;
           if (seekTo(m, guardTarget)) {
+            state.requestedAt = now;
             t = guardTarget;
             if (!complained.has(m)) {
               complained.add(m);
@@ -386,6 +664,7 @@
         mseSeq = 0;
         mseForwarded = 0;
         mseSendFailed = 0;
+        window.postMessage({ __vh: 'mse-ctl', kind: 'replay_inits' }, '*');
         // ⚠️ 这里就是"刷新之后"的那条路：页面重载 → 内容脚本重新注入 → 问后台
         // 现在在不在抓流。**要抓的那一秒也要一起带回来**，否则看护会把位置
         // 扳回 0，用户点的"从当前进度开始"就白点了。
@@ -656,6 +935,7 @@
           mseForwarded = 0;
           mseEmpty = 0;
           mseSendFailed = 0;
+          window.postMessage({ __vh: 'mse-ctl', kind: 'replay_inits' }, '*');
           // 抓流要防"站点续播上次位置"—— 那会让抓到的流中间断掉几百秒
           // （见 guardStart 的注释）。但**用户自己要求的那一秒**除外：
           // "从当前进度开始抓"就是要把位置看住在那一秒上。

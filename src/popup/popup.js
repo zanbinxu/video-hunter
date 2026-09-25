@@ -509,7 +509,10 @@ function renderRecording() {
 
 function finishedToastText(r, real) {
   const what = r?.mode === 'mse' ? '抓流' : '录制';
-  return real ? `${what}完成，视频时长 ${real} —— 去「管理」里保存` : `${what}完成 —— 去「管理」里保存`;
+  const sizeText = r?.size ? `（${formatBytes(r.size)}）` : '';
+  return real
+    ? `${what}完成，视频时长 ${real}${sizeText} —— 去「管理」里保存`
+    : `${what}完成${sizeText} —— 去「管理」里保存`;
 }
 
 async function refreshRecording() {
@@ -705,8 +708,8 @@ function fillSettings(settings) {
   // 「自动保存已录到的部分」（滚动覆盖）：和管理页那张卡是**同一个值**，
   // 在哪边改都算数。间隔只给 5 / 10 / 30 三档，读到的值不在档上就回落到 10。
   $('s-autosnap').checked = settings.autoSnapshotCapture !== false;
-  $('s-autosnap-minutes').value = String([5, 10, 30].includes(Number(settings.autoSnapshotMinutes))
-    ? Number(settings.autoSnapshotMinutes) : 10);
+  $('s-autosnap-minutes').value = String([0.5, 1, 5, 10, 30].includes(Number(settings.autoSnapshotMinutes))
+    ? Number(settings.autoSnapshotMinutes) : 5);
   $('s-autosnap-minutes').disabled = !$('s-autosnap').checked;
   // 这 N 分钟按**录制时间**还是**视频内容时长**算（倍速播放时两者差好几倍）
   $('s-autosnap-basis').value = settings.autoSnapshotBasis === 'media' ? 'media' : 'wall';
@@ -844,8 +847,10 @@ async function init() {
       : '已关闭自动导出：产物只留在私有存储里，需要自己去管理页点「保存到磁盘」');
   });
   $('s-autosnap-minutes').addEventListener('change', (e) => {
-    pushSetting({ autoSnapshotMinutes: Number(e.target.value) });
-    toast(`自动保存间隔改成每 ${e.target.value} 分钟（下一次触发就用新值）`);
+    const mins = Number(e.target.value);
+    const label = mins < 1 ? `${Math.round(mins * 60)} 秒` : `${mins} 分钟`;
+    pushSetting({ autoSnapshotMinutes: mins });
+    toast(`自动保存间隔改成每 ${label}（下一次触发就用新值）`);
   });
   $('s-autocut').addEventListener('change', (e) => {
     pushSetting({ autoCutCapture: e.target.checked });

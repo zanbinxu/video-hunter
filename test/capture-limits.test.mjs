@@ -22,15 +22,18 @@ const STAMP = '20260923-1200';
 test('三类产物的名字形状：差别只在结尾那一段', () => {
   const complete = captureFileName(STAMP, 1, 'Demo');
   const second = captureFileName(STAMP, 2, 'Demo');
+  const frontPart = captureFileName(STAMP, '前段', 'Demo', 'webm');
   const partial = partialCaptureFileName(STAMP, 'Demo');
   const auto = autoSnapshotFileName(STAMP, 'Demo');
 
   assert.match(complete, /^vh-mse-.+20260923-1200\.mp4$/);
   assert.match(second, /-2\.mp4$/);
+  assert.match(frontPart, /-前段\.webm$/);
+  assert.equal(captureFileKind(frontPart), 'complete');
   // 这两条是关键：判据锚在**结尾**，所以 `-部分` 必须真的在结尾
   assert.ok(partial.endsWith('-部分.mp4'), partial);
   assert.ok(auto.endsWith('-自动部分.mp4'), auto);
-  for (const n of [complete, second, partial, auto]) assert.ok(n.includes(STAMP), n);
+  for (const n of [complete, second, frontPart, partial, auto]) assert.ok(n.includes(STAMP), n);
 });
 
 test('三类都能被认出来，而且两套判据不打架', () => {
