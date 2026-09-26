@@ -73,5 +73,5 @@
    - 用户将 `docs/RELEASE-v0.2.6.md` 内容复制到 GitHub Release v0.2.6，并上传 `dist/video-hunter-0.2.6.zip`。
 
 2. **第二步（下一轮真实站点针对性验证与扩展）**：
-   - **验证线路 1**：在 Chrome 中加载已解压扩展 `dist/video-hunter-0.2.6`，实测复杂站点（YouTube 4K、B站 4K AV1、12x 倍速、Joanna 单页多集连播）；
+   - **验证线路 1**：在 Chrome 中加载已解压扩展 `dist/video-hunter-0.2.6`，实测复杂站点（YouTube 4K、B站 4K AV1、12x 倍速、单页多集连播站点）；
    - **验证线路 2**：若遇到极少数特定站点分片既无 `sidx` 也无 `trun.duration`，检查 `src/parser/mse-assemble.js` 第 450-510 行的 `readFragmentMediaTime`，可进一步增加基于前后分片 `baseMediaDecodeTime` 差值的动态 duration 推导作为双重兜底。
